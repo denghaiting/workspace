@@ -4,3 +4,13 @@ printf haha
 
 end the txt
 goodbye
+#ifndef __MAIN_H__
+#define __MAIN_H__
+#include "main.h"
+#define git 2345
+
+
+
+
+
+#endif
