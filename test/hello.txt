@@ -1,1 +1,6 @@
 hello world!
+this is my test txt
+printf haha
+
+end the txt
+goodbye
