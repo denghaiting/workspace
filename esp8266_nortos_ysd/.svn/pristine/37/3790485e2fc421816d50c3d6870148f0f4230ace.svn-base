@@ -1,0 +1,199 @@
+/**************************************************************************
+**  Copyright (c) 2013 GalaxyWind, Ltd.
+**
+**  Project: 魔灯
+**  File:    domain.c
+**  Author:  fangfuhan
+**  Date:    06/12/2016
+**
+**  Purpose:
+**    Dns解析.
+**************************************************************************/
+
+
+/* Include files. */
+#include "iw_priv.h"
+#include "ice_domain.h"
+#include "domain.h"
+
+/* Macro constant definitions. */
+#define DOMAIN_MAX_LENGTH	(64)
+#define DOMAIN_STR_LEN  	(256)
+#define DOMAIN_MAX_IP		(3)
+#define DOMAIN_MAX_IP_INDEX (DOMAIN_MAX_IP - 1)
+
+/* Type definitions. */
+typedef struct ice_domain_s{	
+	bool valid;						//域名字符串是否有效	
+	dm_type_e type;					//域名类型，自动探测还是外部设置的	
+	u_int32_t len; 					//域名的长度	
+	char domain[DOMAIN_STR_LEN];	//域名字符串	
+	bool first;						//第一次获取域名的ip	
+	u_int32_t ip_index;				//ip的索引值	
+	u_int32_t ip_num;           	//域名对应的IP数	
+	u_int32_t ip[DOMAIN_MAX_IP];   	//具体的IP
+}ice_domain_t;
+
+
+/* Local function declarations. */
+
+
+/* Macro API definitions. */
+
+
+/* Global variable declarations. */
+
+static ice_domain_t g_ice_domain;
+extern void srand(unsigned int seed);
+extern int rand(void);
+
+void domain_clear_ip(void);
+
+void ICACHE_FLASH_ATTR domain_init(void)
+{
+	config_t *pconfig = NULL;
+
+	os_memset(&g_ice_domain, 0, sizeof(g_ice_domain));
+
+	//替换服务器设置的
+	pconfig = conf_user_get(SET_ICE_DOMAIN);
+	if (!pconfig || (0 == pconfig->len) || pconfig->len > DOMAIN_MAX_LENGTH) {
+		return;
+	}
+
+	/* 外部对域名进行了设置 */
+	g_ice_domain.valid = true;
+	g_ice_domain.type = DM_SET;
+	g_ice_domain.len = pconfig->len;
+	os_memcpy((u_int8_t *)g_ice_domain.domain, pconfig->value, pconfig->len);
+}
+
+char * ICACHE_FLASH_ATTR domain_get_name(void)
+{
+	if(! g_ice_domain.valid)
+		return NULL;
+
+	return g_ice_domain.domain;
+}
+
+
+/*
+*	设置的域名和有效保存域名一样
+*/
+static bool ICACHE_FLASH_ATTR domain_same(ice_domain_t *ice_domain, char *domain, int len)
+{
+	if (! ice_domain->valid)
+		return false;
+
+	if (ice_domain->len != len)
+		return false;
+
+	return ( (os_memcmp((u_int8_t*)ice_domain->domain, (u_int8_t*)domain, len) == 0) ? true : false);
+}
+
+
+
+/*
+*	注意:
+*		在字符串中添加了一个濉"\0"表示结束，如果domain传递进来的长度就是带有'\0',保存flash多了一个字符，但不影响数据
+*		自动探测的域名不进行保存，外部设置的域名需要保存
+*/
+int ICACHE_FLASH_ATTR domain_set_name(char *domain, int len, dm_type_e type)
+{
+	if (NULL == domain || len > (DOMAIN_STR_LEN - 1))
+		return RS_INVALID_PARAM;
+
+	if (domain_same(&g_ice_domain, domain, len)){
+		return RS_DOMAIN_SAME;
+	}
+
+	g_ice_domain.valid = true;
+	g_ice_domain.type = type;
+	os_memcpy((u_int8_t*)g_ice_domain.domain, (u_int8_t*)domain, len);
+	g_ice_domain.domain[len] = 0;
+	g_ice_domain.len = len + 1;
+
+	if (DM_SET == type){
+		conf_user_set(SET_ICE_DOMAIN, (u_int8_t*)g_ice_domain.domain, g_ice_domain.len);
+	}
+	
+	domain_clear_ip();
+
+	return RS_OK;
+}
+
+
+void ICACHE_FLASH_ATTR domain_clear_ip(void)
+{	
+	g_ice_domain.ip_num = 0;	
+	os_memset(g_ice_domain.ip, 0, sizeof(g_ice_domain.ip));
+}
+
+int ICACHE_FLASH_ATTR domain_set_ip(u_int32_t *ip, int ip_num)
+{
+	int i = 0;
+	
+	if (NULL == ip || ip_num <= 0 || ip_num > DOMAIN_MAX_IP)
+		return RS_INVALID_PARAM;
+
+	for(i = 0; i < ip_num; i++){
+		g_ice_domain.ip[i] = ip[i];
+	}
+
+	g_ice_domain.ip_num = ip_num;
+	g_ice_domain.ip_index = 0;
+	g_ice_domain.first = true;
+
+	return RS_OK;
+}
+
+/*
+*	index 从0开始，最大为2
+*/
+u_int32_t ICACHE_FLASH_ATTR domain_get_ip()
+{
+	u_int32_t index = 0;
+
+	if (g_ice_domain.ip_num == 0)
+		return 0;
+
+	index = g_ice_domain.ip_index;
+	
+	ERROR("domain_get_ip index = [%d] ip = [%u.%u.%u.%u]\r\n", index, IP_SHOW(g_ice_domain.ip[index]));
+	return g_ice_domain.ip[index];
+}
+
+u_int64_t get_random(void)
+{
+	srand(get_up_msec());
+	return rand();
+}
+
+u_int32_t ICACHE_FLASH_ATTR domain_get_next_ip()
+{
+	u_int32_t index = 0;
+	
+	if (g_ice_domain.ip_num == 0)
+		return 0;
+
+
+	if (g_ice_domain.first){
+		g_ice_domain.first = false;
+		//随机值
+		g_ice_domain.ip_index = get_random()% g_ice_domain.ip_num;
+	}else{
+		g_ice_domain.ip_index = (g_ice_domain.ip_index + 1) % g_ice_domain.ip_num;
+	}
+
+	index = g_ice_domain.ip_index;
+
+	return g_ice_domain.ip[index];
+}
+
+
+dm_type_e ICACHE_FLASH_ATTR domain_get_type()
+{
+	return g_ice_domain.type;
+}
+
+

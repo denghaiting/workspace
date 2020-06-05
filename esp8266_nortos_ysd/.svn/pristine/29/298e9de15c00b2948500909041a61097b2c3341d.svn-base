@@ -1,0 +1,225 @@
+/**************************************************************************
+**  Copyright (c) 2013 GalaxyWind, Ltd.
+**
+**  Project: ucd_ap_monitor
+**  File:    ucd_ap_monitor.c
+**  Author:  yuanchao.wong@gmail.com
+**  Date:    04/23/2015
+**
+**  Purpose:
+**    Ucd_ap_monitor.
+**************************************************************************/
+
+/* Include files. */
+#include "c_types.h"
+#include "iw_api.h"
+#include "iw_lede.h"
+#include "iw_lan_srv.h"
+#include "osapi.h"
+#include "iw_priv.h"
+#include "iw_smartconfig.h"
+#include "iw_lede.h"
+
+/* Macro constant definitions. */
+// 最大AP连接时间
+#define MAX_AP_CONNECT_TIME				(20)
+#define MAX_WAIT_SMARTCONFIG_TIME		(20)
+//防止在提示没连接上的情况下，设备连接上了
+#define LEDE_CHANG_TO_BILIK             (MAX_AP_CONNECT_TIME+1)
+#define LEDE_CHANG_TO_NORMOL			(5)
+
+#define     LEDE_FAST_BLINK              0
+#define 	LEDE_SLOW_BLINK		         1
+#define 	LEDE_ALWAYS_ON		         2
+#define 	LEDE_BLINK_3sON_200msOFF     6
+
+
+/* Type definitions. */
+typedef enum {
+	UAMS_WAIT_CONNECT,
+	UAMS_WAIT_SMARTCONFIG,
+	UAMS_END,
+	UAMS_MAX
+} UAM_STATE;
+
+typedef struct {
+	UAM_STATE state;
+	u_int32_t last_time;	// 当前状态持续时间
+} uam_mgr;
+/* Local function declarations. */
+static uam_mgr umgr;
+
+
+/* Macro API definitions. */
+//#define MONI_DEBUG_
+#ifdef MONI_DEBUG_
+#define MONI_INFO(x...) INFO(x)
+#define MONI_DEBUG(x...) DEBUG(x)
+#define MONI_ERROR(x...) ERROR(x)
+#else
+#define MONI_INFO(x...)
+#define MONI_DEBUG(x...)
+#define MONI_ERROR(x...)
+#endif
+
+
+/* Global variable declarations. */
+static int uam_lede_change_to_normol(void *t);
+static int uam_lede_change_timer(void *t);
+extern bool  is_test_ssid(void);
+extern u_int8_t is_product_mode_f();
+
+void ICACHE_FLASH_ATTR uam_set_state(uam_mgr *umgr, UAM_STATE s)
+{
+	if (s < UAMS_MAX && NULL != umgr) {
+		umgr->state = s;
+		umgr->last_time = 0;
+	}
+}
+
+void ICACHE_FLASH_ATTR uam_do_wait_connect(uam_mgr *umgr)
+{
+	if(NULL == umgr){
+		MONI_INFO("ERROR PAR\n");
+		return;
+	}
+	
+	if (is_wifi_up() == TRUE) {
+		MONI_INFO("in wait connect, and wifi is up\n");
+		uam_set_state(umgr, UAMS_END);
+		return;
+	}
+
+	if (umgr->last_time >= MAX_AP_CONNECT_TIME) {
+		MONI_INFO("uam_do_wait_connect timeout, switch to smartconfig\n");
+		wifi_station_set_auto_connect(0);
+		iw_smartcfg_start();
+		uam_set_state(umgr, UAMS_WAIT_SMARTCONFIG);
+	}
+}
+
+void ICACHE_FLASH_ATTR uam_do_wait_smartconfig(uam_mgr *umgr)
+{
+	if(NULL == umgr){
+		MONI_INFO("ERROR PAR\n");
+		return;
+	}	
+	
+	if (is_wifi_up() == TRUE) {
+		MONI_INFO("in wait smartconfig, and wifi is up\n");
+		uam_set_state(umgr, UAMS_END);
+		return;
+	}
+
+	if (umgr->last_time >= MAX_WAIT_SMARTCONFIG_TIME && !is_lock_ap()) {
+		MONI_INFO("uam_do_wait_smartconfig timeout, switch to wait ap connect\n");
+		exit_smartconfig();
+		start_wifi();
+
+		uam_set_state(umgr, UAMS_WAIT_CONNECT);
+	}
+}
+
+
+int ICACHE_FLASH_ATTR uam_timer(void *t)
+{
+	if(NULL == t){
+		return -1;
+	}
+	
+	uam_mgr *umgr = (uam_mgr *)t;
+
+	//连接手机热点ssid，不进入判断
+	if(1 == is_phonehotpoint_mode_f()) {
+		iw_timer_set(TID_UCDC_AP_MONITOR2, TIME_N_SECOND(1), 0,
+		             uam_timer, (void*)umgr);
+		return 0;
+	}
+
+	umgr->last_time++;
+	if (umgr->last_time % 5 == 0) {
+		MONI_DEBUG("uam_timer state %u last_time %u wifi_up [%u] \n", umgr->state, umgr->last_time, is_wifi_up());
+	}
+
+	//串口测试，不进入判断
+	if (is_test_ssid()) {
+		return 0;
+	}
+
+	//连接产测ssid，不进入判断
+	if (1 == is_product_mode_f()) {
+		return 0;
+	}
+
+	switch ((u_int8_t)umgr->state) {
+		case UAMS_WAIT_CONNECT:
+			uam_do_wait_connect(umgr);
+			break;
+
+		case UAMS_WAIT_SMARTCONFIG:
+			uam_do_wait_smartconfig(umgr);
+			break;
+
+		case UAMS_END:
+			if (is_wifi_up() != TRUE && !needsmartconfig()) {
+				uam_set_state(umgr, UAMS_WAIT_CONNECT);
+				iw_timer_set(TID_UCDC_AP_MONITOR1, TIME_N_SECOND(LEDE_CHANG_TO_BILIK), 0,
+				             uam_lede_change_timer, (void*)umgr);
+			}
+			break;
+	}
+
+	iw_timer_set(TID_UCDC_AP_MONITOR2, TIME_N_SECOND(1), 0, uam_timer, (void*)umgr);
+
+	return 0;
+}
+
+void ICACHE_FLASH_ATTR uam_start(void)
+{
+	umgr.state = UAMS_WAIT_CONNECT;
+	umgr.last_time = 0;
+
+	MONI_INFO("uam_start\n");
+
+	// 需要一键配置，不需要监控了
+	if (needsmartconfig()) {
+		uam_set_state(&umgr, UAMS_END);
+	} else {
+		//已经有配置的，需要定时显示状态灯
+		MONI_DEBUG("regist fast blink timer 1\n");
+		iw_timer_set(TID_UCDC_AP_MONITOR1, TIME_N_SECOND(LEDE_CHANG_TO_BILIK), 0,
+		             uam_lede_change_timer, (void*)&umgr);
+	}
+
+	MONI_INFO("uam_start timer\n");
+	iw_timer_set(TID_UCDC_AP_MONITOR2, TIME_N_SECOND(1), 0, uam_timer, (void*)&umgr);
+}
+
+void ICACHE_FLASH_ATTR uam_exit(void)
+{
+
+}
+
+int ICACHE_FLASH_ATTR uam_lede_change_to_normol(void *t)
+{
+	lede_state_set(LEDE_ALWAYS_ON);
+	return 0;
+}
+
+
+int ICACHE_FLASH_ATTR uam_lede_change_timer(void *t)
+{
+	uam_mgr *umgr = (uam_mgr *)t;
+
+	if (is_wifi_up() == TRUE) {
+		return 0;
+	}
+	MONI_DEBUG("start LEDE_FAST_BLINK ");
+	lede_state_set(LEDE_SLOW_BLINK);
+	iw_timer_set(TID_UCDC_AP_MONITOR1, TIME_N_SECOND(LEDE_CHANG_TO_NORMOL), 0,
+	             uam_lede_change_to_normol, (void*)umgr);
+
+	return 0;
+}
+
+

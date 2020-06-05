@@ -1,0 +1,135 @@
+/**************************************************************************
+**  Copyright (c) 2013 GalaxyWind, Ltd.
+**
+**  Project: 魔灯
+**  File:    mu_type.c
+**  Author:  fangfuhan
+**  Date:    04/08/2016
+**
+**  Purpose:
+**    Mu相关.
+**************************************************************************/
+
+
+/* Include files. */
+#include "iw_priv.h"
+#include "mu_type.h"
+#include "ysd_version.h"
+#include "esp8266_ysd.h"
+#include "soft_svn.h"
+#include "iw_user_config.h"
+
+
+/* Macro constant definitions. */
+
+
+/* Type definitions. */
+
+
+/* Local function declarations. */
+
+
+/* Macro API definitions. */
+//#define MT_DEBUG_
+#ifdef MT_DEBUG_
+#define MT_INFO(x...)  INFO(x)
+#define MT_DEBUG(x...) DEBUG(x)
+#define MT_ERROR(x...)  ERROR(x)
+#else
+#define MT_DEBUG(x...)
+#define MT_INFO(x...)
+#define MT_ERROR(x...) ERROR(x)
+#endif
+
+/* Global variable declarations. */
+
+/* Include files. */
+
+void  mu_sys_config_get(void);
+static void  mu_sys_config_default_init(void);
+
+mu_type_t sys_mu_config;
+
+void ICACHE_FLASH_ATTR init_mu_sys_config(void)
+{
+
+	memset(&ucd, 0, sizeof(ucd));		
+
+	sys_mu_config.ucd = &ucd;
+
+	/* license 这个函数不能与下面的函数交换位置，因为密码的这里初始化了，后面也有初始化*/
+	iw_ucd_license();
+	
+	mu_sys_config_default_init();
+	mu_sys_config_get();
+
+	sys_mu_config.init_done = true;
+}
+
+void ICACHE_FLASH_ATTR mu_sys_config_get(void)
+{
+	config_t *config;
+
+	config = conf_user_get(USER_SYS_HOSTNAME);
+	if (config && config->len) {
+		os_memcpy(sys_mu_config.sys.hostname, config->value, config->len);
+	}
+
+	MT_DEBUG("********************************* get password and hostname\n");
+	config = conf_user_get(USER_PASSWD_MD5);
+	if (config && config->len) {
+		MT_DEBUG("********************************* get user passwd success len %d\n", config->len);
+		os_memcpy(sys_mu_config.ucd->passwd_md5, config->value, config->len);
+		mem_dump("1get new paswdmd5", ucd.passwd_md5, sizeof(ucd.passwd_md5));
+		mem_dump("2get new paswdmd5", sys_mu_config.ucd->passwd_md5, sizeof(ucd.passwd_md5));
+	}
+}
+
+void ICACHE_FLASH_ATTR mu_sys_config_save(void)
+{
+	conf_user_set(USER_SYS_HOSTNAME, (UINT8 *)sys_mu_config.sys.hostname, sizeof(sys_mu_config.sys.hostname));
+	conf_user_set(USER_PASSWD_MD5, (UINT8 *)sys_mu_config.ucd->passwd_md5, sizeof(sys_mu_config.ucd->passwd_md5));
+	MT_ERROR("*********************************save hostname %s \r\n", sys_mu_config.sys.hostname);
+}
+
+static void ICACHE_FLASH_ATTR mu_sys_config_default_init(void)
+{
+	sys_t *sys = &sys_mu_config.sys;
+
+	os_memset(sys, 0, sizeof(*sys));
+	os_strcpy(sys->hostname, DEV_HOST_NAME);
+	sys->soft_ver = SOFT_VER;
+	sys->upgrade_ver = UPGRADE_SOFT_VER;
+	sys->soft_svn = SOFT_SVN;
+	sys->hard_ver = HARD_VER;
+
+	sys->time_connect_server = 0;
+}
+
+
+void ICACHE_FLASH_ATTR get_dev_info(dev_info_t *pdev_info)
+{
+	if (!pdev_info) {
+		MT_ERROR("pdev_info is NULLn");
+		return;
+	}
+
+	//soft vertion
+	pdev_info->soft_ver.major = MAJ_VER(sys_mu_config.sys.soft_ver);
+	pdev_info->soft_ver.minor = MIN_VER(sys_mu_config.sys.soft_ver);
+	pdev_info->soft_ver.revise = REV_VER(sys_mu_config.sys.soft_ver);
+
+    pdev_info->stm_ver.major = MAJ_VER(sys_mu_config.sys.smt_soft_ver);	
+    pdev_info->stm_ver.minor = MIN_VER(sys_mu_config.sys.smt_soft_ver);	
+    pdev_info->stm_ver.revise = REV_VER(sys_mu_config.sys.smt_soft_ver);
+	
+	pdev_info->dev_type = ucd.dev_type;
+	pdev_info->ext_type = ucd.ext_type;
+	os_memcpy(pdev_info->vendor, ucd.vendor, sizeof(pdev_info->vendor));
+	//hard dev version
+	pdev_info->hard_ver.major = MAJ_VER(sys_mu_config.sys.hard_ver);
+	pdev_info->hard_ver.minor = MIN_VER(sys_mu_config.sys.hard_ver);
+	pdev_info->hard_ver.revise = REV_VER(sys_mu_config.sys.hard_ver);
+	
+}
+

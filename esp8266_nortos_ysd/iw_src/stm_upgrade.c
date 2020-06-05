@@ -1,0 +1,697 @@
+/**************************************************************************
+**  Copyright (c) 2011 GalaxyWind, Ltd.
+**
+**  Project: stm_upgrade
+**  File:    stm_upgrade.c
+**  Author:  liubenlong
+**  Date:    12/18/2014
+**
+**  Purpose:
+**    单片机升级.
+**************************************************************************/
+
+
+/* Include files. */
+#include "c_types.h"
+#include "types_def.h"
+#include "iw_8266.h"
+#include "iw_platform.h"
+#include "iw_api.h"
+#include "udp_ctrl.h"
+#include "md5.h"
+#include "iw_uptime.h"
+#include "iw_thread_timer.h"
+#include "ds_proto.h"
+#include "iw_debug.h"
+#include "iw_net.h"
+#include "iw_flash.h"
+#include "iw_sys_time.h"
+#include "stm_upgrade.h"
+#include "iw_uart_ijuartpro.h"
+
+#if 0
+#undef INFO
+#undef DEBUG
+#undef ERROR
+
+#define INFO(x...) DBGPRINT_MGMT(DEBUG_ERROR, x)
+#define DEBUG(x...) DBGPRINT_MGMT(DEBUG_ERROR, x)
+#define ERROR(x...) DBGPRINT_MGMT(DEBUG_ERROR, x)
+#endif
+
+
+/* Macro constant definitions. */
+#define MD5_SIZE		16
+#define PACKET_SIZE		210
+
+//第一块升级分片
+#define STM_UPGRADE_FIRST_BLOCK		1
+//升级定时器
+#define STM_UPGRADE_TIMER_DIE		5*60
+
+//stm镜像大小限制
+#define STM_IMAGE_MAX	64*1024
+
+//magic
+#define STM_IMAGE_MAGIC		0X73746d
+
+/* Type definitions. */
+typedef struct stm_upgrade_ctrl_s{
+	//锁定的客户端
+	void *s;
+	bool upgrade_finish;
+	u_int32_t upgrade_addr;
+	u_int32_t upgrade_addr_magic;
+	u_int32_t image_len;
+	u_int16_t image_crc;
+	u_int8_t dev_type; //设备类型，
+	u_int8_t ext_type; //设备扩展类型，
+	u_int8_t major_ver; //主版本号,传参
+	u_int8_t minor_ver; //次版本号,传参
+	u_int8_t image_type;  //固件类型，传参。1-app，2-rf
+	u_int16_t data_crc; //数据CRC
+	//超时
+	int timeout;
+	//记录上次写成功分区，避免重写
+	int upgrade_last_block;	
+	//md5计算
+	u_int8_t md5_cal[MD5_SIZE];
+	MD5_CTX ctx;
+}stm_upgrade_ctrl_t;
+
+
+//image crc
+#define	MAGIC1	"tAIl"
+#define	MAGIC2	"TaiL"
+#define	MAGIC11	"sAIl"
+#define	MAGIC22	"SaiL"
+#pragma pack(push, 1)
+typedef struct {
+	u_int8_t magic1[4];
+	u_int8_t size[2];
+	u_int8_t crc[2];
+	u_int8_t magic2[2];
+	u_int8_t size_h[2];
+} tail_t;
+
+typedef struct {
+	u_int8_t magic1[4];
+	u_int8_t dev_type; //设备类型，
+	u_int8_t ext_type; //设备扩展类型，
+	u_int8_t major_ver; //主版本号,传参
+	u_int8_t minor_ver; //次版本号,传参
+	u_int8_t image_type;  //固件类型，传参。1-app，2-rf
+	u_int8_t crc[2]; //数据CRC
+	u_int8_t pad[1];
+	u_int8_t magic2[4];
+} rf_tail_t;
+#pragma pack(pop)
+/* Local function declarations. */
+extern VOID BSP_EnterActiveMode(VOID);
+extern VOID BSP_ExitActiveMode(VOID);
+
+/* Macro API definitions. */
+
+/* Global variable declarations. */
+stm_upgrade_ctrl_t stm_upgrade_ctrl;
+static bool stm_upgrade_err = false;
+
+static void stm_upgrade_reset(stm_upgrade_ctrl_t *pctl);
+static void stm_upgrade_magic_set(stm_upgrade_ctrl_t *pctl, bool mc);
+extern void serial_ver_query_again(void);
+int rf_upgrade_process = 0;
+
+
+static u_int16_t ICACHE_FLASH_ATTR YModemCrc(u_int16_t CRC, u_int8_t *pData, u_int16_t sLen)
+{  
+   u_int16_t i = 0;
+   
+   while (sLen--)  //len是所要计算的长度
+   {
+       CRC = CRC^(int)(*pData++) << 8; //    
+       for (i=8; i!=0; i--) 
+       {
+           if (CRC & 0x8000)   
+               CRC = CRC << 1 ^ 0x1021;    
+           else
+               CRC = CRC << 1;
+       }    
+   }
+
+   return CRC;
+}
+
+//手机客户端锁定
+static bool ICACHE_FLASH_ATTR upgrade_client_check(stm_upgrade_ctrl_t *pctl, void *s)
+{
+	if (pctl->s == NULL) {
+		pctl->s = s;
+		return true;
+	}
+
+	if (pctl->s == s) {
+		return true;
+	}
+
+	return false;
+}
+
+
+static int ICACHE_FLASH_ATTR stm_upgrade_timer(void *arg)
+{
+	stm_upgrade_ctrl_t *pctl = (stm_upgrade_ctrl_t *)arg;
+
+	if (pctl->upgrade_finish == false) {
+		stm_upgrade_reset(pctl);
+	}
+
+	return 0;
+}
+
+static void ICACHE_FLASH_ATTR stm_upgrade_timeron(stm_upgrade_ctrl_t *pctl)
+{
+	//CL_THREAD_OFF(pctl->t_upgrade_die);
+	//CL_THREAD_TIMER_ON(pctl->master, pctl->t_upgrade_die, stm_upgrade_timer, (void *)pctl, TIME_N_SECOND(pctl->timeout));
+	iw_timer_delete(TID_STM_UPGRADE_TIMER);
+	iw_timer_set(TID_STM_UPGRADE_TIMER, TIME_N_SECOND(STM_UPGRADE_TIMER_DIE), 0, stm_upgrade_timer, pctl);
+}
+
+static bool ICACHE_FLASH_ATTR upgrade_check_block(stm_upgrade_ctrl_t *pctl, u_int16_t block)
+{
+	if (pctl->upgrade_last_block == block) {
+		return false;
+	}
+
+	if (block == STM_UPGRADE_FIRST_BLOCK) {
+		stm_upgrade_reset(pctl);
+		//这里开启定时器，避免升级失败可以再次升级
+		stm_upgrade_timeron(pctl);		
+		stm_upgrade_magic_set(pctl, false);
+	}
+
+	return true;
+}
+
+static bool ICACHE_FLASH_ATTR upgrade_check_block2(stm_upgrade_ctrl_t *pctl,u_int16_t block)
+{
+	if (block != (pctl->upgrade_last_block + 1)) {
+		ERROR("error block=%u last_block=%u\n", 
+			block, pctl->upgrade_last_block);
+		return false;
+	}
+
+	return true;
+}
+
+//镜像md5检测函数
+static bool ICACHE_FLASH_ATTR upgrade_md5_check(stm_upgrade_ctrl_t *pctl, u_int8_t *md5)
+{
+	
+	Md5_Final(pctl->md5_cal, &pctl->ctx);
+
+	if (memcmp(pctl->md5_cal, md5, MD5_SIZE) != 0) {
+		ERROR("md5 check failed\n");
+		mem_dump("md5_cal", pctl->md5_cal, MD5_SIZE);
+		mem_dump("md5", md5, MD5_SIZE);
+		return false;
+	}
+	
+	return true;
+}
+
+static bool ICACHE_FLASH_ATTR upgrade_image_check(stm_upgrade_ctrl_t *pctl, u_int32_t data_len)
+{
+	if ((pctl->upgrade_addr + data_len) >= (STM_IMAGE_OFFSET + STM_IMAGE_MAX) ||
+		pctl->upgrade_addr < STM_IMAGE_OFFSET) {
+		ERROR("error write addr=%08x data_len=%u\n", pctl->upgrade_addr, data_len);
+		return false;
+	}
+
+	return true;
+}
+
+static bool ICACHE_FLASH_ATTR image_crc_check(stm_upgrade_ctrl_t *pctl, u_int8_t *data, u_int32_t data_len)
+{
+	tail_t tail, *ptail;
+	rf_tail_t rf_tail, *rf_ptail;
+
+	if (data_len < sizeof(tail_t) + sizeof(rf_tail_t)) {
+		ERROR("tail len %d error\n", data_len);
+		return false;
+	}
+
+	ptail = &tail;
+	memcpy((void *)ptail, &data[data_len - sizeof(tail_t)], sizeof(tail_t));
+	rf_ptail = &rf_tail;
+	memcpy((void *)rf_ptail, &data[data_len - sizeof(tail_t) - sizeof(rf_tail_t)], sizeof(rf_tail_t));
+	pctl->image_crc = YModemCrc(pctl->image_crc, data, data_len - sizeof(tail_t));
+	pctl->image_len += data_len;
+	
+
+	if ( (memcmp(ptail->magic1, MAGIC1, 4) == 0 && memcmp(ptail->magic2, MAGIC2, 4) == 0) ||
+		(memcmp(ptail->magic1, MAGIC11, 4) == 0 && memcmp(ptail->magic2, MAGIC22, 2) == 0) ){
+		if (((ptail->size[0] << 8) | ptail->size[1]) != 
+			((pctl->image_len - sizeof(tail_t)) & 0xffff)) {
+			ERROR("len error size=%u recv_len=%u\n", 
+				((ptail->size[0] << 8) | ptail->size[1]), pctl->image_len);
+			return false;
+		}
+
+		if (memcmp(ptail->magic1, MAGIC11, 4) == 0) {
+			if (((ptail->size_h[0] << 8) | ptail->size_h[1]) != 
+				((pctl->image_len - sizeof(tail_t)) & 0xffff0000) >> 16) {
+				ERROR("len error size_h=%u recv_len=%u\n", 
+					((ptail->size_h[0] << 8) | ptail->size_h[1]), pctl->image_len);
+				return false;
+			}
+		}
+		
+		if (ptail->crc[0] != ((pctl->image_crc >> 8)&0xFF) ||
+			ptail->crc[1] != (pctl->image_crc&0xFF)) {
+			ERROR("crc error netcrc=%u , calcrc=%u\n", 
+				((ptail->crc[0] << 8) | ptail->crc[1]), pctl->image_crc);
+			return false;
+		}
+
+		pctl->image_type = rf_ptail->image_type;
+		pctl->dev_type = rf_ptail->dev_type;
+		pctl->ext_type = rf_ptail->ext_type;
+		pctl->major_ver = rf_ptail->major_ver;
+		pctl->minor_ver = rf_ptail->minor_ver;
+		memcpy((u_int8_t*)&pctl->data_crc, rf_ptail->crc, 2);
+
+		return true;;
+	}
+#if 0
+	for(i = 0; i < 50; i++) {
+		if (i%16) {
+			ERROR("\n");
+		}
+		ERROR("%02x ", data[data_len-i-1]);
+	}
+	ERROR("\n");
+
+	for(i = 0; i < 12; i++) {
+		ERROR("i=%d %02x\n", i, ((u_int8_t *)(ptail))[i]);
+	}
+
+	ERROR("pctl->image_len=%u\n", pctl->image_len);
+	ERROR("err magic 1 =%02x:%02x:%02x:%02x\n", ptail->magic1[0], ptail->magic1[1], ptail->magic1[2], ptail->magic1[3]);
+	ERROR("err magic 2 =%02x:%02x:%02x:%02x\n", ptail->magic2[0], ptail->magic2[1], ptail->magic2[2], ptail->magic2[3]);	
+#endif
+	return false;
+}
+
+static bool ICACHE_FLASH_ATTR upgrade_block(stm_upgrade_ctrl_t *pctl, u_int16_t total_block, u_int16_t block, u_int8_t *data, u_int32_t data_len)
+{
+	bool ret = true;
+	
+	DEBUG("the cur block=%u write addr=%08x data_len=%u\n", 
+		block, pctl->upgrade_addr, data_len);
+
+	//上层做地址校验，避免升级失败丢失配置。
+	if (upgrade_image_check(pctl, data_len) == false) {
+		return false;
+	}
+
+	if (flash_write(pctl->upgrade_addr, data_len, data) == true) {
+		//成功后更新数据及块
+		pctl->upgrade_addr += data_len;
+		pctl->upgrade_last_block = (int)block;
+		Md5_Update(&pctl->ctx, data, data_len);
+		//这里做下crc校验
+		if (block + 1 < total_block) {
+			pctl->image_crc = YModemCrc(pctl->image_crc, data, data_len);
+		} else {
+			return image_crc_check(pctl, data, data_len);
+		}
+		pctl->image_len += data_len;		
+	} else {
+		ERROR("flash write error1 %x, %d, %p\n", 
+			pctl->upgrade_addr, data_len, data);
+		
+		
+		ret = false;
+	}
+
+	return ret;
+}
+
+static void ICACHE_FLASH_ATTR stm_upgrade_magic_set(stm_upgrade_ctrl_t *pctl, bool mc)
+{
+	stm_image_hd_t hd;
+	u_int8_t buff[FLASH_PAGE_SIZE];
+
+	memset((void *)&hd, 0, sizeof(hd));
+	
+	if (mc) {
+		hd.magic = STM_IMAGE_MAGIC;
+		hd.magic2 = STM_IMAGE_MAGIC;
+		hd.len = pctl->image_len - sizeof(tail_t) - sizeof(rf_tail_t);
+		hd.data_crc = pctl->data_crc;
+		hd.image_type = pctl->image_type;
+		hd.dev_type = pctl->dev_type;
+		hd.ext_type = pctl->ext_type;
+		hd.major_ver = pctl->major_ver;
+		hd.minor_ver = pctl->minor_ver;
+		memcpy(buff, (u_int8_t *)&hd, sizeof(hd));
+	}
+
+	flash_write(pctl->upgrade_addr_magic, FLASH_PAGE_SIZE, buff);
+}
+
+
+#define STM_IMAGE_MAGIC		0X73746d
+#define req_upgrade             (0x05)  //请求升级
+#define upgrade_transfer        (0x06)  //升级数据传送
+
+enum {
+	STM_UPGRADE_INIT,
+	STM_UPGRADE_DATA_SEND,
+	STM_UPGRADE_ERROR,
+	STM_UPGRADE_OK
+};
+
+typedef struct {
+	u_int8_t pre_data1; 
+	u_int8_t pre_data2;
+	u_int8_t rid;
+	u_int8_t cmd;
+	u_int16_t param_len;
+	u_int8_t ret;
+	u_int8_t checksum;
+} uart_hdr_t;
+
+typedef struct {
+    uint16_t upgrade_datasize;
+    uint16_t upgrade_datacrc;
+}upgrade_head_t;
+
+stm_image_hd_t upgrade_hd;
+static int stm_upgrade_state = STM_UPGRADE_INIT;
+static int stm_upgrade_state_count = 0;
+static uint16_t stm_upgrade_offset = 0;
+u_int8_t uart_checksum(u_int8_t *data, u_int16_t data_len);
+void base_uart_send(u_int8_t *data, u_int16_t len);
+//extern int base_uart_send_data(u_int8_t *data, u_int16_t len);
+
+UINT32 tx_buf32[60];
+UINT8 *tx_buf = ((UINT8*)tx_buf32) + 2;
+
+static void ICACHE_FLASH_ATTR stm_send_data(void)
+{
+	uart_hdr_t * up_hdr = (uart_hdr_t *)(tx_buf);
+	UINT16 read_len;
+
+	up_hdr->pre_data1 = 0xff;
+    up_hdr->pre_data2 = 0xaa;
+    up_hdr->rid = 0x00;
+    up_hdr->cmd = upgrade_transfer;
+    up_hdr->ret = 0;
+	*(UINT16*)(tx_buf+8) = htons(stm_upgrade_offset);
+
+	if (stm_upgrade_offset >= upgrade_hd.len) {
+		read_len = 0;
+	} else {
+		read_len = upgrade_hd.len - stm_upgrade_offset;
+	}
+
+	if (read_len > PACKET_SIZE)
+		read_len = PACKET_SIZE;
+	
+	if (read_len > 0)
+		flash_read_new(STM_IMAGE_OFFSET + FLASH_PAGE_SIZE + stm_upgrade_offset, read_len, tx_buf + 10);
+
+    up_hdr->checksum = uart_checksum(tx_buf, 10 + read_len);
+	up_hdr->param_len = htons(2 + read_len);
+
+	INFO("stm_send_data offset = %d, len = %d\r\n", stm_upgrade_offset, read_len);
+
+	base_uart_send(tx_buf, 10 + read_len);
+}
+
+static int ICACHE_FLASH_ATTR stm_upgrade(void * arg)
+{
+    uint8_t i;
+	uart_hdr_t * up_hdr = (uart_hdr_t *)(tx_buf);
+	
+	INFO("stm_upgrade state = %d\r\n", stm_upgrade_state);
+	switch (stm_upgrade_state) {
+		case STM_UPGRADE_INIT:
+			if (stm_upgrade_state_count > 20) {
+				stm_upgrade_state = STM_UPGRADE_ERROR;
+				rf_upgrade_process = 0;
+				INFO("stm_upgrade time out1\r\n");
+				break;
+			}
+			//send request
+
+		    up_hdr->pre_data1 = 0xff;
+		    up_hdr->pre_data2 = 0xaa;
+		    up_hdr->rid = 0x00;
+		    up_hdr->cmd = req_upgrade;
+		    up_hdr->param_len = htons(0x08);
+		    up_hdr->ret = 0x2c;
+		    ((upgrade_head_t*)(tx_buf+8))->upgrade_datasize = htons(upgrade_hd.len);
+		    ((upgrade_head_t*)(tx_buf+8))->upgrade_datacrc = upgrade_hd.data_crc;
+			*(tx_buf+12) = (upgrade_hd.major_ver & 0xf0) >> 4;
+			*(tx_buf+13) = upgrade_hd.major_ver & 0x0f;
+			*(tx_buf+14) = upgrade_hd.minor_ver;
+			*(tx_buf+15) = 0;
+		    up_hdr->checksum = uart_checksum(tx_buf, 16);
+            for(i=0; i<11; i++) {
+                uart0_tx_buffer(tx_buf, 16);
+                os_delay_us(10);
+            }
+			stm_upgrade_state_count++;
+			iw_timer_delete(TID_STM_TIMER);
+			iw_timer_set(TID_STM_TIMER, TIME_N_SECOND(3), 0, stm_upgrade, NULL);
+            uart_init(BIT_RATE_115200, BIT_RATE_115200);
+
+		break;
+
+		case STM_UPGRADE_DATA_SEND:
+			if (stm_upgrade_state_count > 20) {
+				stm_upgrade_state = STM_UPGRADE_ERROR;
+				rf_upgrade_process = 0;
+				INFO("stm_upgrade time out1\r\n");
+				break;
+			}
+
+			stm_send_data();
+			stm_upgrade_state_count++;
+			iw_timer_delete(TID_STM_TIMER);
+			iw_timer_set(TID_STM_TIMER, TIME_N_SECOND(3), 0, stm_upgrade, NULL);
+		break;
+
+		default:
+		break;
+	}
+	return 0;
+}
+
+void ICACHE_FLASH_ATTR stm_upgrade_recv(UINT8 * data, UINT8 len) {
+	uart_hdr_t *hdr = (uart_hdr_t *)data;	
+	UINT16 offset;
+
+	//return;
+
+	stm_upgrade_state_count = 0;
+	switch (hdr->cmd) {
+		case req_upgrade:
+			INFO("stm_upgrade_recv up = %d, len = %d\r\n", data[9], len);
+			if (data[9] == 1) {
+                stm_upgrade_state = STM_UPGRADE_OK;
+                rf_upgrade_process = 0;
+                iw_sys_reboot();
+			} else {
+				stm_upgrade_state = STM_UPGRADE_DATA_SEND;
+				stm_upgrade_offset = 0;
+				INFO("enter DATA_SEND\r\n");
+			}
+			
+		break;
+
+		case upgrade_transfer:
+			offset = ntohs(*(UINT16*)(data + 8));
+			INFO("stm_upgrade_recv offset = %d, myoff = %d\r\n", offset, stm_upgrade_offset);
+			if (offset == stm_upgrade_offset) {
+				stm_upgrade_offset += PACKET_SIZE;
+				if (stm_upgrade_offset >= upgrade_hd.len) {
+					stm_upgrade_state = STM_UPGRADE_INIT;
+					stm_upgrade_offset = 0;
+				} else 
+					stm_send_data();
+			}
+
+			iw_timer_delete(TID_STM_TIMER);
+			iw_timer_set(TID_STM_TIMER, TIME_N_SECOND(3), 0, stm_upgrade, NULL);
+			
+		break;
+
+		default:
+		break;
+	}
+}
+
+
+void ICACHE_FLASH_ATTR gw_update_init(UINT32 addr){
+	
+
+	//判断magic
+	flash_read_new(addr, sizeof(upgrade_hd), (u_int8_t *)&upgrade_hd);
+	
+	if (upgrade_hd.magic != STM_IMAGE_MAGIC ||
+		upgrade_hd.magic2 != STM_IMAGE_MAGIC ||
+		upgrade_hd.len == 0) {
+		ERROR("there is no stm image\n");
+		return;
+	}
+
+	rf_upgrade_process = 1;
+
+	stm_upgrade_state = STM_UPGRADE_INIT;
+	stm_upgrade_state_count = 0;
+	stm_upgrade_offset = 0;
+	
+	iw_timer_delete(TID_STM_TIMER);
+	iw_timer_set(TID_STM_TIMER, TIME_N_SECOND(3), 0, stm_upgrade, NULL);
+	
+	INFO("gw_update_init, len=%d, dev_type=%d, ext=%d, maj=%d, min=%d,img=%d\n", 
+		upgrade_hd.len, upgrade_hd.dev_type, upgrade_hd.ext_type, upgrade_hd.major_ver, upgrade_hd.minor_ver, upgrade_hd.image_type);
+}
+
+
+
+void ICACHE_FLASH_ATTR do_ucot_system_stm_upgrade_image(iw_event_info_t *info, iw_obj_t *uobj)
+{
+	u_int8_t *data = NULL;
+	u_int32_t data_len = 0;	
+	u_int16_t err = ERR_NONE;
+	u_int8_t *md5_get = NULL;
+	stm_upgrade_header_t *hd = NULL;
+	stm_upgrade_ctrl_t *pctl = &stm_upgrade_ctrl;
+
+	//这里要锁定一下手机客户端，避免多人升级
+	if (upgrade_client_check(pctl, info->s) == false) {
+		ERROR("multi client upgrade now\n");
+		goto err;
+	}
+
+	if (rf_upgrade_process) {
+		ERROR("rf upgrade in progress\n");
+		goto err;
+	}
+
+	//升级成功判断，避免成功后再收到升级包
+	if (pctl->upgrade_finish) {
+		ERROR("upgrade ok already \n");
+		goto err;
+	}
+	
+	if (info->action != UCA_SET) {
+		ERROR("only support set\n");
+		goto err;
+	}
+
+	if (uobj->param_len < STM_UPGRADE_HEADER_SIZE) {
+		ERROR("error param");
+		goto err;
+	}
+
+	hd = (stm_upgrade_header_t *)(info + 1);
+	hd->current_block = htons(hd->current_block);
+	hd->total_block = htons(hd->total_block);
+	
+	data = (u_int8_t *)&hd[1];
+	data_len = uobj->param_len - STM_UPGRADE_HEADER_SIZE;
+
+	if (hd->total_block == 0 || 
+		hd->current_block > hd->total_block) {
+		ERROR("error block cur=%u total=%u\n", hd->current_block, hd->total_block);
+		goto err;
+	}
+
+	//判断是否相同的分片，如果是直接回OK
+	if(upgrade_check_block(pctl, hd->current_block) == false) {
+		ERROR("sys_upgrade_check_block  retry block=%u\n", hd->current_block);
+		uc_do_set_reply((ucp_obj_t *)uobj, err);
+		goto err;
+	}
+
+	//判断是否与上次分片离得较远，这样就没用了，错误返回
+	if(upgrade_check_block2(pctl, hd->current_block) == false) {
+		ERROR("sys_upgrade_check_block2 block=%u\n", hd->current_block);
+		goto err;
+	}
+
+	INFO("hd->total_block=%u hd->current_block=%u\n", hd->total_block, hd->current_block);
+	//判断一下分片是否到最后了
+	if (hd->total_block == hd->current_block) {
+		if (data_len != MD5_SIZE) {
+			ERROR("error md5 len=%u\n", data_len);
+			goto err;
+		}
+		md5_get = data;
+		
+		//md5验证
+		if (upgrade_md5_check(pctl, md5_get) == false) {
+			ERROR("image md5 check failed\n");			
+			goto err;
+		}
+		pctl->upgrade_finish = true;
+		// TODO:写下magic
+		stm_upgrade_magic_set(pctl, true);
+
+		INFO("***********image recv OK.**************\n");
+		
+		gw_update_init(pctl->upgrade_addr_magic);
+		stm_upgrade_reset(pctl);
+	} else {
+		if (upgrade_block(pctl, hd->total_block, hd->current_block, data, data_len) == false) {
+			ERROR("upgrade block failed\n");
+			goto err;
+		}
+		stm_upgrade_timeron(pctl);
+	}
+	uc_do_set_reply((ucp_obj_t *)uobj, err);
+	
+	return;	
+	
+err:
+	stm_upgrade_err = true;	
+	
+}
+
+static void ICACHE_FLASH_ATTR stm_upgrade_reset(stm_upgrade_ctrl_t *pctl)
+{
+	pctl->s = NULL;	
+	Md5_Init(&pctl->ctx);
+	pctl->upgrade_finish = false;
+	pctl->upgrade_last_block = 0;
+	pctl->image_len = 0;
+	pctl->image_crc = 0;
+	pctl->timeout = STM_UPGRADE_TIMER_DIE;
+	pctl->upgrade_addr_magic = STM_IMAGE_OFFSET;
+	pctl->upgrade_addr = STM_IMAGE_OFFSET + FLASH_PAGE_SIZE;	
+	memset(pctl->md5_cal, 0, sizeof(pctl->md5_cal));	
+}
+
+void ICACHE_FLASH_ATTR stm_upgrade_init(void)
+{
+	memset((void *)&stm_upgrade_ctrl, 0, sizeof(stm_upgrade_ctrl));
+	
+	stm_upgrade_reset(&stm_upgrade_ctrl);
+}
+
+bool ICACHE_FLASH_ATTR is_stm_upgrade_err(void)
+{
+	return stm_upgrade_err;
+}
+
+void ICACHE_FLASH_ATTR stm_upgrade_err_reset(void)
+{
+	stm_upgrade_err = false;
+}
+
+

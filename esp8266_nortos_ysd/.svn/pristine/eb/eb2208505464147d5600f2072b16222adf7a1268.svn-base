@@ -1,0 +1,1078 @@
+/**************************************************************************
+**  Copyright (c) 2013 GalaxyWind, Ltd.
+**
+**  Project: 魔灯
+**  File:    ice_domain.c
+**  Author:  fangfuhan
+**  Date:    06/12/2016
+**
+**  Purpose:
+**    Dns解析.
+**************************************************************************/
+
+
+/* Include files. */
+#include "iw_priv.h"
+#include "ice_domain.h"
+#include "domain.h"
+#include "dns_client.h"
+#include "mem.h"
+
+/* Macro constant definitions. */
+#define ENABLE_SD 1
+#define NO_RESO_ONE_DONAME 0
+#define RESO_OK 1
+#define RESO_NOWING 0
+#define RESOED_DONAME 1
+#define NO_RESOED_DONAME 0
+#define FIRST_ONE 0
+#define RESO_SAVE_DONAME_NUM 4
+
+#define DNS_PAD_NUM			(3)
+#define DNS_REP_NUM			(4)
+#define DN_MAX_SYS_ERR      (30)
+#define MAX_PLD_PKT_SIZE    (256)
+#define DNS_TEST_START      (8)
+#define TEST_IP_NUM  		(3)
+
+#define TEST_IP "0.0.0.0" //测试时使用: 上传给服务器解析的IP地址，0代表本地外网IP  
+//#define TEST_IP "54.93.186.223" //测试时使用: 上传给服务器解析的IP地址，0代表本地外网IP  
+//#define TEST_IP "40.118.106.4" //测试时使用: 上传给服务器解析的IP地址，0代表本地外网IP  
+
+/* Type definitions. */
+	
+
+typedef struct {	
+	int type;	
+	char *data;
+} dn_event_t;
+
+enum {	
+	ICE_DN_IDLE,			//空闲状态	
+	ICE_DN_RESOLVE_DIS,     //解析探测服务器的域名。实际是银河风云的ice服务器	
+	ICE_DN_PROBE,		    //探测设备需要连接的ice域名	
+	ICE_DN_RESOLVE,		   //解析ice域名的IP	
+	ICE_DN_MAX
+};
+
+enum {	
+	//开始事件	
+	DN_EVENT_START,
+	//接收到数据包事件	
+	DN_EVENT_PKT,	
+	//解析固定域名
+	DN_EVENT_DONAME,
+	//事件事件	
+	DN_EVENT_TIME,
+};
+
+typedef void (* dn_func_t)(dn_t *dn);
+typedef void (*dn_proc_func_t)(dn_t *dn, dn_event_t *event);
+
+typedef struct {
+	char *name;
+	// 进入本状态调用的函数
+	dn_func_t on_into;
+	// 离开本状态调用的函数
+	dn_func_t on_out;
+	// 处理报文
+	dn_proc_func_t proc_pkt;
+} dn_proc_t;
+
+/*
+*	探测的通讯报文
+*/
+#pragma pack(push, 1)
+typedef struct {
+	u_int32_t test_ip;	//测试IP
+	u_int64_t sn;		//设备的SN
+	//tlv
+} dns_probe_t;
+#pragma pack(pop)
+
+struct hostent {
+    char  *h_name;      /* Official name of the host. */
+    char **h_aliases;   /* A pointer to an array of pointers to alternative host names,
+                           terminated by a null pointer. */
+    int    h_addrtype;  /* Address type. */
+    int    h_length;    /* The length, in bytes, of the address. */
+    char **h_addr_list; /* A pointer to an array of pointers to network addresses (in
+                           network byte order) for the host, terminated by a null pointer. */
+#define h_addr h_addr_list[0] /* for backward compatibility */
+};
+
+/* Local function declarations. */
+
+
+/* Macro API definitions. */
+//#define ICE_DN_DEBUG_TEST
+#ifdef ICE_DN_DEBUG_TEST
+#define DN_DEBUG(fmt...)  DBGPRINT_MGMT(DEBUG_ERROR, fmt)
+#define DN_INFO(fmt...)   DBGPRINT_MGMT(DEBUG_ERROR, fmt)
+#define DN_ERROR(fmt...)  DBGPRINT_MGMT(DEBUG_ERROR, fmt)
+#else
+
+#define DN_DEBUG(fmt...)  DEBUG(fmt)
+#define DN_INFO(fmt...)   ERROR(fmt)
+#define DN_ERROR(fmt...)  ERROR(fmt)
+
+#endif
+
+
+/* Global variable declarations. */
+
+// 探测可选择的端口
+static u_int16_t srv_port[] = {
+	DEV_REGSERVER_PORT2,
+	DEV_REGSERVER_PORT1,
+	DEF_DISPATCHER_UDP_PORT,
+};
+
+static gdr_hostent_t srv_doname[] = {
+	{"cn.ice.galaxywind.com", 	0 ,  {0 , 0 , 0}},  //中国
+	{"ie.ice.galaxywind.com", 	0 ,  {0 , 0 , 0}},  //爱尔兰
+	{"de.ice.galaxywind.com", 	0 ,  {0 , 0 , 0}},  //德国
+	{"us.ice.galaxywind.com", 	0 ,  {0 , 0 , 0}},  //美国
+	{"jp.ice.galaxywind.com", 	0 ,  {0 , 0 , 0}},  //日本
+	{"sg.ice.galaxywind.com", 	0 ,  {0 , 0 , 0}},  //新加坡
+	{"br.ice.galaxywind.com", 	0 ,  {0 , 0 , 0}},  //巴西
+	{"au.ice.galaxywind.com", 	0 ,  {0 , 0 , 0}},  //澳大利亚
+	{"www.baidu.com", 			0 ,  {0 , 0 , 0}},  //百度
+	{"www.qq.com", 				0 ,  {0 , 0 , 0}},  //QQ
+	{"www.163.com", 			0 ,  {0 , 0 , 0}},  //163邮箱
+};
+
+
+const static u_int32_t srv_doname_num = sizeof(srv_doname) / sizeof(srv_doname[0]);
+const static u_int32_t srv_port_num = sizeof(srv_port) / sizeof(srv_port[0]);
+static void dn_print_srv_doname(dn_t *dn);
+static int dn_resolve_gethostbyname(char *name, dn_t *dn);
+static int dn_reso_doname_timer(void *t);
+static int dn_reso_doname_pro(void *t);
+int get_ser_ip(dn_t *dn, u_int32_t ip[3]);
+static dn_t g_dn;
+static dn_t *g_dn_p = &g_dn;
+
+static void dn_event_done(dn_t *dn, dn_event_t *event);
+static void dn_set_state(dn_t *dn , int state);
+
+int ICACHE_FLASH_ATTR dn_start(void)
+{	
+	dn_event_t event;	
+	event.type = DN_EVENT_START;	
+	event.data = NULL;	
+	dn_event_done(g_dn_p, &event);	
+	return RS_OK;
+}
+
+static bool ICACHE_FLASH_ATTR dn_resovle_ok(dn_t *dn)
+{
+	int i;
+
+	for(i = 0; i < dn->domain_num; i++) {
+		if (dn->reso_doname[i].ip_num != 0) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+
+/*
+*	nl6621的sdk没有清除dns缓存的接口，并且不能直接修改lwip的代码。
+*	查看dns的代码，发现其缓存最为4个域名.因此使用填充4个域名方式来清空缓存。
+*
+*    其他平台有这个接口，直接调用平台接口
+*    
+*    注意:
+*		增加了dns_cli后，每次都发报文请求，因此不需要清除dns cache缓存
+*
+*/
+static void ICACHE_FLASH_ATTR dn_flush_dns_cache(void)
+{
+}
+
+static u_int32_t ICACHE_FLASH_ATTR dn_find_valid_ip(dn_t *dn)
+{
+	int i = 0;
+	u_int32_t ip = 0;
+
+	//- TEST_IP_NUM主要是子返回我们需要使用的域名ip镜像判断
+	for(i = 0; i < dn->domain_num - TEST_IP_NUM; i++) {
+		if (dn->reso_doname[i].ip_num != 0) {
+			ip = dn->reso_doname[i].ip[0];
+			break;
+		}
+	}
+
+	return ip;
+	
+}
+
+static bool ICACHE_FLASH_ATTR dn_real_dns_ip(u_int32_t ice_ip, dn_t *dn)
+{
+	int i = 0;
+	
+	if ( 0 == ice_ip )
+		return false;
+
+	/* 只要有一个相等认为是网关返回的域名地址而不是真正域名服务器返回的 */
+	for(i = dn->domain_num - TEST_IP_NUM; i < dn->domain_num; i++){
+		if (ice_ip == srv_doname[i].ip[0])
+			break;
+	}
+
+	return (i == dn->domain_num ? true :false);
+}
+
+static int ICACHE_FLASH_ATTR dn_dsn_reso(void *t)
+{	
+	dn_t *dn = (dn_t *)t;
+	int rt;
+	
+	if(dn->reso_index < dn->domain_num && ENABLE_SD == dn->enable_send_doname){
+		dn->enable_send_doname = NO_RESO_ONE_DONAME;
+
+		rt = dn_resolve_gethostbyname(dn->reso_doname[dn->reso_index].doname, dn);
+		if(rt <= 0){
+			DN_ERROR("send dns pkt is error rt = [%d]\r\n", rt);
+			dn->enable_send_doname = ENABLE_SD;//发送失败继续发送
+		}
+		iw_timer_set(TID_DN_TIMER, TIME_N_SECOND(6), 1, dn_reso_doname_timer, (void *)dn);
+		return RS_OK;
+	}
+
+	if(dn->reso_ok != RESO_OK){
+		return RS_OK;
+	}
+	
+	dn_print_srv_doname(dn);
+	
+	iw_timer_delete(TID_DN_TIME_EVENT);
+	iw_timer_delete(TID_DN_TIMER);
+
+	iw_timer_set(TID_DN_SIGN_RESO_TIME, 200, 0, dn_reso_doname_pro, (void *)dn);
+	return RS_OK;
+}
+
+static void ICACHE_FLASH_ATTR dn_add_time_event(dn_t *dn)
+{	
+	DN_DEBUG("state[%d] start dns\r\n", dn->state);
+	iw_timer_set(TID_DN_TIME_EVENT, 100, 1, dn_dsn_reso, (void *)dn);
+}
+
+static void ICACHE_FLASH_ATTR dn_print_srv_doname(dn_t *dn)
+{
+	int i = 0;
+
+	for(i = 0; i < dn->domain_num; i++){
+		DN_INFO("[%s] ip_num(%d) IP1:%d.%d.%d.%d  IP2:%d.%d.%d.%d IP3:%d.%d.%d.%d \r\n", 
+			dn->reso_doname[i].doname, dn->reso_doname[i].ip_num, 
+			IP_SHOW(dn->reso_doname[i].ip[0]),IP_SHOW(dn->reso_doname[i].ip[1]), IP_SHOW(dn->reso_doname[i].ip[2]));
+	}
+}
+
+static int ICACHE_FLASH_ATTR dn_reso_doname_pro(void *t)
+{	
+	dn_event_t event;	
+	dn_t *dn = NULL;	
+	dn = (dn_t *)t;
+
+	event.type = dn->afreso_event;
+	event.data = (char*)dn->rcv_buf;	
+	dn_event_done(dn, &event);
+	return 1;
+}
+
+void  ICACHE_FLASH_ATTR dns_send(void *arg)
+{
+        //os_printf("send ok\n");
+}
+
+
+static void ICACHE_FLASH_ATTR dn_hdr_order(net_header_t *hdr)
+{
+	if (NULL == hdr)
+		return;
+	
+	hdr->command = ntohs(hdr->command);
+	hdr->param_len = ntohl(hdr->param_len);
+	hdr->handle = ntohl(hdr->handle);
+}
+
+void ICACHE_FLASH_ATTR pro_parse(struct espconn *conn, char *pdata, unsigned short length)
+{
+	dn_t *dn;
+	net_header_t *nhd;
+
+	dn = (dn_t *)conn->reverse;	
+
+	os_memcpy(dn->rcv_buf, pdata, length);
+	nhd = (net_header_t *)dn->rcv_buf;
+
+	dn_hdr_order(nhd);
+		
+	if (nhd->command != CMD_UDP_DNS_PROB) {
+		DN_ERROR("cmd error\n");
+		return ;
+	}
+
+	//关定时器
+	
+	iw_timer_set(TID_DN_SIGN_RESO_TIME, 200, 0, dn_reso_doname_pro, (void *)dn);
+	
+}
+
+static void ICACHE_FLASH_ATTR pro_dns_read(void *arg, char *pdata, unsigned short length)
+{
+	remot_info *premot = NULL;
+	struct espconn *conn = NULL;	
+	
+	//DN_ERROR("recv pro data: %u\n", length);
+	
+	if(pdata == NULL || !arg)
+		return;
+	
+	if (length < (SIZEOF_DNS_HDR + SIZEOF_DNS_QUERY + SIZEOF_DNS_ANSWER)){
+		DN_ERROR("Recv byte(%d) less than %d\r\n", length, (SIZEOF_DNS_HDR + SIZEOF_DNS_QUERY + SIZEOF_DNS_ANSWER));		
+		return ;
+	}
+	
+	conn = arg;	
+	
+	if (espconn_get_connection_info(conn,&premot,0) == ESPCONN_OK){
+		 conn->proto.udp->remote_port = premot->remote_port;
+		 conn->proto.udp->remote_ip[0] = premot->remote_ip[0];
+		 conn->proto.udp->remote_ip[1] = premot->remote_ip[1];
+		 conn->proto.udp->remote_ip[2] = premot->remote_ip[2];
+		 conn->proto.udp->remote_ip[3] = premot->remote_ip[3];
+		 DN_ERROR("%s recv from ip %u.%u.%u.%u port:%d\n", __FUNCTION__,
+		   	conn->proto.udp->remote_ip[0],
+		   	conn->proto.udp->remote_ip[1],
+		   	conn->proto.udp->remote_ip[2],
+		   	conn->proto.udp->remote_ip[3],
+		   	conn->proto.udp->remote_port);
+	} else {
+		DN_ERROR("%s get romote ip and port fialed\n",__FUNCTION__);
+		return;
+	}
+
+	pro_parse(conn, pdata, length);
+
+	return ;
+}
+
+void ICACHE_FLASH_ATTR change_state(dn_t *dn)
+{
+	dn->reso_index++;
+	dn->enable_send_doname = ENABLE_SD;
+	dn->dns_send_index = 0;
+
+	if(dn->domain_num <= dn->reso_index){//全部解析完成， 不用在去解析了
+		dn->enable_send_doname = NO_RESO_ONE_DONAME;
+		dn->reso_ok = RESO_OK;												
+	}		
+}
+
+void ICACHE_FLASH_ATTR pro_data(struct espconn *conn, char *data, unsigned short length)
+{
+	dn_t *dn;
+	int i = 0;
+
+	dn = (dn_t *)conn->reverse;
+
+	dn->reso_doname[dn->reso_index].ip_num = dns_cli_parse_packet(dn->reso_doname[dn->reso_index].doname, 
+																	(u_int8_t *)data, 
+																	(int)length, 
+																	dn->reso_doname[dn->reso_index].ip, 
+																	NDS_CLI_MAX_IP);	
+
+	
+
+	if(0 == dn->reso_doname[dn->reso_index].ip_num){
+		if(dn->dns_send_index == 0){
+			dn->dns_send_index = 1;
+			dn->enable_send_doname = ENABLE_SD;
+		}else{
+			dn->dns_send_index = 0;
+			change_state(dn);	
+		}
+		return;
+	}
+	
+	for (i = 0; i < NDS_CLI_MAX_IP; i++) {
+		dn->reso_doname[dn->reso_index].ip[i] = ntohl(dn->reso_doname[dn->reso_index].ip[i]);
+	}	
+
+	DN_DEBUG("num[%d]  IP1:[%u.%u.%u.%u:%u], IP2:[%u.%u.%u.%u:%u], IP3:[%u.%u.%u.%u:%u]\r\ns", 
+		dn->reso_doname[dn->reso_index].ip_num , 
+		IP_SHOW(dn->reso_doname[dn->reso_index].ip[0]),																					IP_SHOW(dn->reso_doname[dn->reso_index].ip[1]),
+		IP_SHOW(dn->reso_doname[dn->reso_index].ip[2]));
+	
+	change_state(dn);
+}
+
+static void ICACHE_FLASH_ATTR dns_read(void *arg, char *pdata, unsigned short length)
+{
+	struct espconn *conn = NULL;
+	remot_info *premot = NULL;
+	
+	if(pdata == NULL || !arg)
+		return;
+	
+	if (length < (SIZEOF_DNS_HDR + SIZEOF_DNS_QUERY + SIZEOF_DNS_ANSWER)){
+		DN_ERROR("Recv byte(%d) less than %d\r\n", length, (SIZEOF_DNS_HDR + SIZEOF_DNS_QUERY + SIZEOF_DNS_ANSWER));		
+		return ;
+	}
+
+	conn = (struct espconn *)arg;
+		
+	if (espconn_get_connection_info(conn,&premot,0) == ESPCONN_OK){
+		 conn->proto.udp->remote_port = premot->remote_port;
+		 conn->proto.udp->remote_ip[0] = premot->remote_ip[0];
+		 conn->proto.udp->remote_ip[1] = premot->remote_ip[1];
+		 conn->proto.udp->remote_ip[2] = premot->remote_ip[2];
+		 conn->proto.udp->remote_ip[3] = premot->remote_ip[3];
+		 DN_DEBUG("%s recv from ip %u.%u.%u.%u port:%d\n", __FUNCTION__,
+		   	conn->proto.udp->remote_ip[0],
+		   	conn->proto.udp->remote_ip[1],
+		   	conn->proto.udp->remote_ip[2],
+		   	conn->proto.udp->remote_ip[3],
+		   	conn->proto.udp->remote_port);
+	} else {
+		DN_ERROR("%s get romote ip and port fialed\n",__FUNCTION__);
+		return;
+	}
+
+	pro_data(conn, pdata, length);
+	
+	return ;
+}
+
+static int ICACHE_FLASH_ATTR dn_reso_doname_timer(void *t)
+{	
+	dn_t *dn = (dn_t *)t;
+
+	if(dn->dns_send_index == 0){
+		dn->dns_send_index = 1;
+		dn->enable_send_doname = ENABLE_SD;
+		return 1;
+	}
+
+	//如果刚刚接收完数据， 就执行次超时，会跳过一个域名， 会少解析一个，为了屏蔽此问题加dn->enable_send_doname != 1
+	if(dn->reso_index < dn->domain_num && dn->enable_send_doname != ENABLE_SD){
+		DN_ERROR("timer is timer out\r\n");
+		dn->reso_index++;
+		dn->dns_send_index = 0;
+		dn->enable_send_doname = ENABLE_SD;
+	}
+
+	if(dn->domain_num <= dn->reso_index){
+		dn->enable_send_doname = NO_RESO_ONE_DONAME;
+		dn->reso_ok = RESO_OK;
+	}
+	
+	DN_ERROR("dn_reso_doname_timer is timer out\r\n");
+	return 1;
+}
+
+static int ICACHE_FLASH_ATTR dn_resolve_gethostbyname(char *name, dn_t *dn)
+{	
+	return dns_cli_gethostbyname(name, dn);
+}
+
+/*
+*	使用的是tcp协议的网络头部
+*/
+static pkt_t * ICACHE_FLASH_ATTR dn_pkt_new(u_int32_t param_len)
+{
+	net_header_t *nh;
+	pkt_t *pkt = NULL;
+	int total_len = sizeof(pkt_t) + net_header_size + param_len;
+
+	if ((pkt = (pkt_t *)os_malloc(total_len)) == NULL) {
+		DN_ERROR( "%s alloc %d failed\n", __FUNCTION__, total_len);
+		return NULL;
+	}
+
+	pkt->data = (u_int8_t *)(pkt + 1);
+	pkt->total = net_header_size + param_len;
+	pkt->cmd = CMD_UDP_DNS_PROB;
+
+	nh = (net_header_t *)pkt->data;
+
+	nh->ver = PROTO_VER1;
+	nh->hlen = net_header_size >> 2;
+	nh->compress = 0;
+	nh->encrypt = 0;
+	nh->ds_type = TP_DS007;
+	nh->command = htons(CMD_UDP_DNS_PROB);
+	nh->param_len = htonl(param_len);
+	nh->handle = htonl(nh);
+
+	return pkt;
+}
+
+
+/*
+*	理论超时时间:
+*		每隔0.5秒发送一个包
+*		每个包重发3次
+*		每一个IP三个端口，一个IP需要发9个包。
+*		一个域名最多3个IP, 一个域名为28个包。 
+*		总共8个域名, 最大总时间  8 * 28 * 0.5 = 112秒。
+*
+*	nl6621时间:
+*		一个域名一个IP:  8 * 9 * 0.5 = 36秒
+*/
+static int ICACHE_FLASH_ATTR dn_poll_next_conn(dn_t *dn)
+{
+
+	/* 端口先遍历一遍*/
+	if (dn->port_idx + 1 < srv_port_num) {
+		dn->port_idx++;
+		return 1;
+	}
+
+	/* IP遍历一遍 */
+	if (dn->ip_idx + 1 < srv_doname[dn->domain_idx].ip_num) {
+		dn->port_idx = 0;
+		dn->ip_idx++;
+		return 1;
+	}
+
+	/* 遍历探测服务器 */
+	do{	
+		dn->domain_idx++;
+		dn->ip_idx = 0;
+		dn->port_idx = 0;
+	}while(dn->domain_idx < srv_doname_num && srv_doname[dn->domain_idx].ip_num == 0);
+
+
+	if (dn->domain_idx < srv_doname_num)
+		return 1;
+	
+	return 0;
+}
+
+
+static int ICACHE_FLASH_ATTR dn_send_timer(void *cp)
+{
+    int n;
+    dn_t *dn;
+	u_int32_t ip;
+	u_int16_t port;
+
+
+    dn = (dn_t *)cp;
+    
+   
+    if (dn->send_retry >= 3) {
+        dn->send_retry = 0;
+
+        if (!dn_poll_next_conn(dn)) {
+			dn_set_state(dn, ICE_DN_RESOLVE_DIS);
+            return 0;
+        }
+    }
+
+	DEBUG("dn_send_timer into\r\n");
+	iw_timer_set(TID_PRO_REV_SEND_TIME, TIME_N_SECOND(1), 0, dn_send_timer, (void *)dn);	
+	dn->send_retry++;
+
+	ip = srv_doname[dn->domain_idx].ip[dn->ip_idx];
+	port = srv_port[dn->port_idx]; 
+	n = iw_udp_send(ip, port, (char *)dn->pkt->data, dn->pkt->total, dn->dns_conn);
+	if (n <= 0) {
+		DN_ERROR("send failed !!! \r\n ");
+	} else {
+		DN_ERROR("send OK ");
+	}
+
+	DN_ERROR("doname=%s ip=%d.%d.%d.%d port=%d\n", srv_doname[dn->domain_idx].doname, 
+	IP_SHOW(srv_doname[dn->domain_idx].ip[dn->ip_idx]), srv_port[dn->port_idx]);
+
+    return 0;
+}
+
+/*
+	如果没有一个域名解析到正确的ip,设置成最后一个域名索引值。 
+	正常流程不会出现这样情况，因为在上一个状态判断了只是有一个有效ip才会到这个状态。
+*/
+static u_int32_t ICACHE_FLASH_ATTR dn_find_domain_idx()
+{
+	int i = 0;
+	u_int32_t idx = srv_doname_num - 1 - TEST_IP_NUM;
+
+	//111  处理
+	for(i = 0; i < srv_doname_num - TEST_IP_NUM; i++) {
+		if (srv_doname[i].ip_num != 0) {
+			idx = i;
+			break;
+		}
+	}
+
+	return idx;
+}
+
+void  ICACHE_FLASH_ATTR pro_dns_send(void *arg)
+{
+        //os_printf("send ok\n");
+}
+
+int ICACHE_FLASH_ATTR find_server_ip(char *dn_name)
+{
+	int i;
+
+	for(i = 0; i < srv_doname_num; i++) {
+		if(!os_strncmp(srv_doname[i].doname, dn_name, os_strlen(dn_name))){
+			if(srv_doname[i].ip_num != 0)
+				return i;
+		}
+	}
+
+	return -1;	
+}
+
+void ICACHE_FLASH_ATTR sign_doname_reso(dn_t *dn)
+{
+	char *dn_name = NULL;
+
+
+	dn->is_reso_doname = NO_RESOED_DONAME;//切换状态时， 需要置这个表示才会去释放下面分配的内存， 不然会内存泄露
+	dn->reso_doname = os_malloc(sizeof(gdr_hostent_t) * RESO_SAVE_DONAME_NUM);
+	if(dn->reso_doname == NULL){
+		ERROR("reso malloc error!!\r\n");
+		dn_set_state(dn, ICE_DN_RESOLVE_DIS);
+		return ;
+	}
+	os_memset(dn->reso_doname, 0, sizeof(gdr_hostent_t) * RESO_SAVE_DONAME_NUM);
+
+	dn_name	= domain_get_name();
+	
+	dn->reso_doname[0].doname = dn_name;
+	dn->reso_doname[1].doname = srv_doname[DNS_TEST_START].doname;
+	dn->reso_doname[2].doname = srv_doname[DNS_TEST_START + 1].doname;
+	dn->reso_doname[3].doname = srv_doname[DNS_TEST_START + 2].doname;
+	
+	dn->domain_num = RESO_SAVE_DONAME_NUM; 
+
+	dn->reso_index = FIRST_ONE;
+	dn->enable_send_doname = ENABLE_SD;	
+	dn->reso_ok = RESO_NOWING;
+	dn->dns_send_index = 0;
+	
+	dn->afreso_event = DN_EVENT_TIME;
+	dn->ip_index = 0;	
+	
+	dn_add_time_event(dn);	
+}
+
+void ICACHE_FLASH_ATTR pro_reso_ip(dn_t *dn, int ip_index)
+{	
+
+	dn->afreso_event = DN_EVENT_TIME;
+	dn->ip_index = ip_index;
+
+	iw_timer_set(TID_DN_SIGN_RESO_TIME, 200, 0, dn_reso_doname_pro, (void *)dn);
+
+}
+
+int ICACHE_FLASH_ATTR get_ser_ip(dn_t *dn, u_int32_t ip[3])
+{
+	int i, count = 0;
+	
+	for(i = 0; i < 3; i++){
+		ip[i] = dn->reso_doname[dn->ip_index].ip[i];
+		if(0 != ip[i]){
+			count++;
+		}
+	}
+
+	return count;
+}
+
+#if 1
+
+/*
+*	外部设置的域名，则不进行重新探测.
+*	自动探测的域名，每次都需要重新探测
+*/
+static void ICACHE_FLASH_ATTR dn_idle_proc(dn_t *dn, dn_event_t *event)
+{
+	char *domain_name = NULL;
+	
+	if (event->type != DN_EVENT_START)
+		return;
+
+	/* 已经探测保存过连接的域名，不用探测直接进行域名解析*/
+	domain_name = domain_get_name();
+	if(domain_name != NULL && domain_get_type() == DM_SET){
+		dn_set_state(dn, ICE_DN_RESOLVE);
+		return;
+	}
+
+	dn_set_state(dn, ICE_DN_RESOLVE_DIS);
+}
+
+static void ICACHE_FLASH_ATTR dn_resolve_dis_domain_into(dn_t *dn)
+{
+	int i = 0;
+
+	for(i = 0; i < srv_doname_num; i++) {
+		srv_doname[i].ip_num = 0;
+		os_memset(srv_doname[i].ip, 0, sizeof(srv_doname[i].ip));
+	}	
+
+	dn_print_srv_doname(dn);
+
+	dn->reso_doname = srv_doname;
+	dn->domain_num = srv_doname_num;
+	dn->reso_index = FIRST_ONE;		
+	dn->enable_send_doname = ENABLE_SD;//第一次发送解析包需要使用
+	dn->afreso_event = DN_EVENT_TIME;
+	dn->reso_ok = RESO_NOWING;
+	dn->dns_send_index = 0;//从第零个server ip开始
+
+	dn->is_reso_doname = NO_RESOED_DONAME;
+	dn_add_time_event(dn);		
+	
+
+}
+
+static void ICACHE_FLASH_ATTR dn_resolve_dis_domain_proc(dn_t *dn, dn_event_t *event)
+{
+	u_int32_t test_ip = 0;
+	
+	if (event->type != DN_EVENT_TIME)
+		return;
+
+	dn_flush_dns_cache();
+	
+	INFO("judge doname is OK!\r\n");
+
+	/* 没有成功就一直解析 */
+	if (! dn_resovle_ok(dn)){
+		DN_ERROR("dn_resovle_ok ERROR\r\n");
+		dn_set_state(dn, ICE_DN_RESOLVE_DIS);
+		return;
+	}
+
+	/*域名的IP不是真正域名服务器返回的，而是路由器网关拦截返回的。*/
+	test_ip = dn_find_valid_ip(dn);
+	if (! dn_real_dns_ip(test_ip, dn)){
+		DN_ERROR("dn_real_dns_ip ERROR\r\n");
+		dn_set_state(dn, ICE_DN_RESOLVE_DIS);
+		return;
+	}
+
+	dn->is_reso_doname = RESOED_DONAME;
+	dn_set_state(dn,ICE_DN_PROBE);
+	
+}
+
+static void ICACHE_FLASH_ATTR dn_probe_ice_domain_into(dn_t *dn)
+{
+	dns_probe_t *dns_probe = NULL;
+	net_header_t *hdr = NULL;
+	u_int32_t test_ip = 0;
+	struct in_addr inp;
+
+	
+	dn->afreso_event = DN_EVENT_PKT;
+	dn->domain_idx = 0;
+
+	dn->ip_idx = 0;
+	dn->port_idx = 0;
+	dn->send_retry = 0;
+	
+	dn->dns_conn = (struct espconn *)iw_udp_server_create(0, 0, pro_dns_read, pro_dns_send);	
+	if(dn->dns_conn == NULL) {
+		DN_ERROR("dns udp_server_create failed \r\n");		
+		goto err;
+	}	
+	dn->dns_conn->reverse = (void *)dn;
+
+	//使用calloc会错误 ， 不知道什么原因
+	dn->rcv_buf = (u_int8_t *)os_malloc(MAX_PLD_PKT_SIZE);
+	if (NULL == dn->rcv_buf) {
+		DN_ERROR( "%s rcvbuf alloc failed\n", __FUNCTION__);
+		goto err;
+	}
+
+	dn->pkt = dn_pkt_new(sizeof(*dns_probe));
+	if (NULL == dn->pkt) {
+		DN_ERROR("Malloc dn probe packet failed!!!!\r\n");
+		goto err;
+	}
+
+	//111
+	if(inet_aton(TEST_IP, &inp) == 0){
+		test_ip = 0;
+	}else{
+		test_ip = ntohl(inp.s_addr);
+	}
+
+
+	hdr = (net_header_t *)dn->pkt->data;
+
+	dns_probe = (dns_probe_t *)(hdr + 1);
+	dns_probe->test_ip = htonl(test_ip);
+	dns_probe->sn = ntoh_ll(g_dev.sn);
+
+	DN_DEBUG("test ip:[str:%s][%08x, %d.%d.%d.%d]\r\n",TEST_IP,dns_probe->test_ip, IP_SHOW(ntohl(dns_probe->test_ip)));
+	DN_DEBUG("sn:%llu  g_dev:[%016x]\r\n", ntoh_ll(dns_probe->sn),g_dev.sn);
+
+	dn->domain_idx = dn_find_domain_idx();
+
+    iw_timer_set(TID_PRO_REV_SEND_TIME, TIME_N_SECOND(0), 0, dn_send_timer, (void *)dn);
+
+	dn->sys_err_num = 0;
+	return;
+
+err:
+	if (dn->pkt != NULL) {
+		os_free(dn->pkt);
+		dn->pkt = NULL;
+	}
+
+	if (dn->rcv_buf != NULL) {
+		os_free(dn->rcv_buf);
+		dn->rcv_buf = NULL;
+	}
+
+	dn->sys_err_num++;
+	if (dn->sys_err_num > DN_MAX_SYS_ERR){
+		iw_request_event(EVENT_SYS_REBOOT);
+	}
+
+	dn_set_state(dn, ICE_DN_RESOLVE_DIS);
+}
+
+void ICACHE_FLASH_ATTR dn_probe_ice_domain_out(dn_t *dn)
+{
+	if (dn->pkt != NULL) {
+		os_free(dn->pkt);
+		dn->pkt = NULL;
+	}
+	
+	iw_timer_delete(TID_PRO_REV_SEND_TIME);	
+	if (dn->rcv_buf != NULL) {
+		os_free(dn->rcv_buf);
+		dn->rcv_buf = NULL;
+	}
+
+	if(dn->dns_conn != NULL){
+        espconn_delete(dn->dns_conn);
+        os_free(dn->dns_conn);
+		dn->dns_conn = NULL;
+	}
+}
+
+void ICACHE_FLASH_ATTR dn_probe_ice_domain_proc(dn_t *dn, dn_event_t *event)
+{
+	net_header_t *nhd;
+	u_int32_t g_ip; //设备的外网ip
+	u_int32_t *NetIP;
+	char *domain;
+	u_int16_t param_name_len, rcv_name_len;
+
+	if (event->type != DN_EVENT_PKT) {
+		return;
+	}
+
+	nhd = (net_header_t *)event->data;
+	
+	if (nhd->param_len < sizeof(*NetIP)){
+		DN_ERROR("Want param_len(%u)>len(%u),but error\r\n", nhd->param_len, sizeof(*NetIP));
+		return;
+	}
+	
+	// 当前设备的外网IP
+	NetIP  = (u_int32_t *)(nhd + 1);
+	g_ip   =  ntohl(*NetIP);
+	domain = (char *)(NetIP + 1);
+
+	param_name_len = nhd->param_len - sizeof(*NetIP) - 1;
+	rcv_name_len = os_strlen(domain);
+	if (rcv_name_len > param_name_len)
+		rcv_name_len = param_name_len;
+
+	g_ip = g_ip;
+	DN_DEBUG("RECV: Gobal_iP=%d.%d.%d.%d domain=[%s]\n", IP_SHOW(g_ip), domain);
+
+	domain_set_name(domain, rcv_name_len, DM_PROBE);
+	
+	dn_set_state(dn, ICE_DN_RESOLVE);
+
+}
+
+void ICACHE_FLASH_ATTR dn_resolve_domain_into(dn_t *dn)
+{
+	
+	int rt;
+	char *domain_name = NULL;
+	
+	domain_clear_ip();
+
+	/* 已经探测保存过连接的域名，不用探测直接进行域名解析*/
+	domain_name = domain_get_name();
+	if(domain_name != NULL && domain_get_type() == DM_SET){
+		DN_DEBUG("has save doname, go resolve\r\n");
+		sign_doname_reso(dn);
+		return;
+	}
+	
+	if(dn->is_reso_doname == RESOED_DONAME){
+		rt = find_server_ip(domain_name);
+		//探测的域名已经解析过
+		if(rt >= 0){
+			DN_DEBUG("hasn't save doname, aready resolve, go get ip\r\n");
+			pro_reso_ip(dn, rt);
+		//探测的域名没有解析过
+		}else{
+			DN_DEBUG("hasn't save doname, set doname is not find, go resolve doname\r\n");
+			sign_doname_reso(dn);
+		}
+		
+	}	
+
+}
+
+
+void ICACHE_FLASH_ATTR dn_resolve_domain_out(dn_t *dn)
+{
+	if(dn->is_reso_doname == NO_RESOED_DONAME && NULL != dn->reso_doname){
+		os_free(dn->reso_doname);
+		dn->reso_doname = NULL;
+	}
+}
+
+void ICACHE_FLASH_ATTR dn_resolve_domain_proc(dn_t *dn, dn_event_t *event)
+{
+	int ip_num;
+	u_int32_t ip[3];
+	u_int32_t test_ip = 0;
+
+	dn_flush_dns_cache();
+	os_memset(ip, 0, sizeof(ip));
+		
+	if (event->type != DN_EVENT_TIME)
+		return;
+
+	/* 没有成功就一直解析 */
+	if (! dn_resovle_ok(dn)){
+		DN_ERROR("dn_resovle_ok ERROR\r\n");
+		dn_set_state(dn, ICE_DN_RESOLVE_DIS);
+		return;
+	}
+
+	/*域名的IP不是真正域名服务器返回的，而是路由器网关拦截返回的。*/
+	test_ip = dn_find_valid_ip(dn);
+	if (! dn_real_dns_ip(test_ip, dn)){
+		DN_ERROR("dn_real_dns_ip ERROR\r\n");
+		dn_set_state(dn, ICE_DN_RESOLVE_DIS);
+		return;
+	}
+	
+	ip_num = get_ser_ip(dn, ip);
+
+	domain_set_ip(ip, ip_num);
+	
+	DN_DEBUG("[] ==> [num=%d](IP1:%d.%d.%d.%d IP2:%d.%d.%d.%d IP3:%d.%d.%d.%d)\r\n",
+		ip_num, IP_SHOW(ip[0]),IP_SHOW(ip[1]),IP_SHOW(ip[2]));
+
+	if(dn->reso_conn != NULL){
+        espconn_delete(dn->reso_conn);
+        os_free(dn->reso_conn);
+		dn->reso_conn = NULL;
+	}	
+
+	dn_set_state(dn, ICE_DN_IDLE);
+
+}
+
+#endif
+
+static dn_proc_t dn_proc[ICE_DN_MAX] = {
+	{"IDEL", NULL, NULL, dn_idle_proc},
+	{"RESOLVE_DIS_DOMAIN", dn_resolve_dis_domain_into, NULL, dn_resolve_dis_domain_proc},
+	{"PROBE_ICE_DOMAIN", dn_probe_ice_domain_into, dn_probe_ice_domain_out, dn_probe_ice_domain_proc},
+	{"RESOLVE_DOMAIN", dn_resolve_domain_into, dn_resolve_domain_out, dn_resolve_domain_proc}
+};
+
+static void ICACHE_FLASH_ATTR dn_set_state(dn_t *dn , int state)
+{
+	int pre_state = dn->state;
+
+	ASSERT(dn != NULL);
+
+	dn->state = state;
+
+	DN_INFO("DN machine modify status from %s to %s\n",
+	        dn_proc[pre_state].name, dn_proc[state].name);
+
+	if (dn_proc[pre_state].on_out != NULL) {
+		dn_proc[pre_state].on_out(dn);
+	}
+	
+	if (dn_proc[state].on_into != NULL) {
+		dn_proc[state].on_into(dn);
+	}
+}
+
+
+static void ICACHE_FLASH_ATTR dn_event_done(dn_t *dn, dn_event_t *event)
+{
+	ASSERT(dn != NULL || event != NULL);
+
+	DN_DEBUG("%d event Generate !\r\n", event->type);
+
+	if (dn_proc[dn->state].proc_pkt != NULL) {
+		dn_proc[dn->state].proc_pkt(dn, event);
+	}
+}
+
+
+void ICACHE_FLASH_ATTR dn_init(void)
+{
+#define DNS_PORT_BASE	40000
+#define DNS_PORT_END	60000
+#define DNS_MAX_TRY_COUNT	100
+
+	int i = 0;
+	static u_int16_t port = 0;
+	
+	os_memset(g_dn_p, 0, sizeof(*g_dn_p));
+
+	if (port == 0) {
+		port = (g_dev.sn % 10000) + DNS_PORT_BASE;
+	}
+
+	for (i = 0; i < DNS_MAX_TRY_COUNT; i++, port++) {
+		if (port >= DNS_PORT_END) {
+			port = (g_dev.sn % 10000) + DNS_PORT_BASE;
+		}
+
+		g_dn_p->reso_conn = (struct espconn *)iw_udp_server_create(0, port, dns_read, dns_send);	
+		if(g_dn_p->reso_conn != NULL) {
+			break;
+		} else {
+			DN_ERROR("creat port %u failed when iw_init_dev_udp\n", port);
+		}
+	}
+
+	if (g_dn_p->reso_conn == NULL) {
+		DN_ERROR("init_dev_udp clinet failed\n");
+		return ;
+	}
+
+	g_dn_p->reso_conn->reverse = (void *)g_dn_p;
+
+	g_dn_p->state = ICE_DN_IDLE;
+	dn_set_state(g_dn_p, ICE_DN_IDLE);
+	
+}
+
+

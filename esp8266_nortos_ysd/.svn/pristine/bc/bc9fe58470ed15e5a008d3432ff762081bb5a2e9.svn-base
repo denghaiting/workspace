@@ -1,0 +1,639 @@
+/******************************************************************************
+ * Copyright 2013-2014 Espressif Systems (Wuxi)
+ *
+ * FileName: user_plug.c
+ *
+ * Description: plug demo's function realization
+ *
+ * Modification history:
+ *     2014/5/1, v1.0 create this file.
+*******************************************************************************/
+ 
+#include "iw_priv.h"
+#include "user_esp_platform.h"
+#include "user_light.h"
+#include "iw_lede.h"
+#include "iw_user_config.h"
+
+
+#define FLASH_WRITE_FAIL_MAX_NUM		5
+#define FLASH_FLAG_WRITE_FAIL_MAX_NUM	10
+
+#define MF_MAX_ITEM_SIZE			(1024)
+
+
+/* Type definitions. */
+
+/* Local function declarations. */
+static bool flash_check_page(u_int32_t *dstaddr, u_int32_t *srcaddr, u_int8_t force_out) ;
+
+static u_int32_t fb_valid_unit( block_t *block);
+static u_int32_t fb_next_unit(block_t *block);
+static void fb_erase_unit(block_t *block, u_int32_t unit);
+
+static void fb_get_one_config(config_t *config, u_int8_t *buf, u_int32_t *len);
+
+/* Macro API definitions. */
+//#define MF_DEBUG_TEST
+#ifdef MF_DEBUG_TEST
+#define MF_DEBUG(fmt...)   DEBUG(fmt)
+#define MF_INFO(fmt...)	   INFO(fmt)
+#define MF_ERROR(fmt...)   ERROR(fmt)
+#define MF_TEST(fmt...)	   ERROR(fmt)
+#else
+#define MF_DEBUG(fmt...)   DEBUG(fmt)
+#define MF_INFO(fmt...)	   INFO(fmt)
+#define MF_ERROR(fmt...)   ERROR(fmt)
+#define MF_TEST(fmt...)
+#endif
+
+#define FB_WRITE_PAGE(unit_stat, addr, page) \
+	do{ 	\
+		RS ret;	\
+		ret = flash_write_page(addr, page); \
+		if (ret != RS_OK){		\
+			unit_stat->continue_failed++; \
+			unit_stat->fail_count++; \
+			MF_ERROR("flash_write_page failed\r\n"); \
+			return RS_ERROR;		\
+		}						\
+	}while(0)
+
+#define MF_CONFIG_HEAD_SIZE	sizeof(config_head_t)
+
+
+/* Global variable declarations. */
+static u_int8_t temp_page_buf[FLASH_PAGE_SIZE];
+
+RS  ICACHE_FLASH_ATTR flash_write_page(u_int32_t addr, u_int8_t *pbuf)
+{
+	flash_write(addr, FLASH_PAGE_SIZE, pbuf);
+
+	if(flash_check_page((u_int32_t *)addr, (u_int32_t *)pbuf, 1) == false) {
+		return RS_ERROR;
+	}
+
+	return RS_OK;
+}
+
+
+//还是写成函数吧，有升级那儿要用，尽量减少代码量,参数，有如果写１０次都不成功，估计是flash坏了，在升级时最好不要强制退出，不然退出也挂了
+static bool  ICACHE_FLASH_ATTR flash_check_page(u_int32_t *dstaddr, u_int32_t *srcaddr, u_int8_t force_out)
+{
+//	int delay;
+	int num = 0;
+
+	while(1) {
+		if (num++ > 10 && 1 == force_out) {
+			return false;
+		}
+		if(flash_read_new((u_int32_t)dstaddr, FLASH_PAGE_SIZE, temp_page_buf) != true) {
+			return false;
+		}
+
+		if (os_memcmp(temp_page_buf, srcaddr, FLASH_PAGE_SIZE) == 0) {
+			break;
+		}
+		if(flash_write((u_int32_t)dstaddr, FLASH_PAGE_SIZE, (u_int8_t*)srcaddr) != true) {
+			return false;
+		}
+	}
+
+	return true;
+}
+
+/*
+*	单元的编号从0开始
+*/
+static u_int32_t ICACHE_FLASH_ATTR fb_valid_unit( block_t *block)
+{
+	u_int32_t addr;
+	int i = 0;
+
+	if (block->unit_num == 1)
+		return 0;
+
+	for(i = 0; i < block->unit_num; i++) {
+		addr = block->flash_offset + i * block->unit_size;
+		os_memset(temp_page_buf, 0, sizeof(temp_page_buf));
+		flash_read_new(addr, sizeof(temp_page_buf), temp_page_buf);
+		if (os_memcmp(temp_page_buf, &block->magic, sizeof(block->magic)) == 0) {
+			return i;
+		}
+	}
+
+	return 0;
+}
+
+static u_int32_t ICACHE_FLASH_ATTR fb_next_unit(block_t *block)
+{
+	int i = 0;
+	u_int32_t next_unit = 0;
+	block_unit_stat_t *stat = NULL;
+
+	if (block->unit_num == 1)
+		return 0;
+
+	/* 如果这块已经连续10次保存不成功，认为这个存储单元坏掉了 */
+	for(i = 1; i <= block->unit_num; i++) {
+		next_unit = (block->valid_unit + i) % block->unit_num;
+		stat = &block->unit_stat[next_unit];
+		if (stat->continue_failed < 10) {
+			break;
+		}
+	}
+
+	return next_unit;
+}
+
+
+static bool ICACHE_FLASH_ATTR fb_magic_valid(u_int32_t addr, u_int32_t magic)
+{
+	bool ret = true;
+
+	os_memset(temp_page_buf, 0, sizeof(temp_page_buf));
+	flash_read_new(addr,  sizeof(temp_page_buf), temp_page_buf);
+
+	if (os_memcmp(temp_page_buf, &magic, sizeof(magic)) != 0) {
+		u_int32_t *temp;
+		temp = (u_int32_t*)&temp_page_buf[0];
+		temp = temp;		//解决编译警告
+		MF_INFO("need magic(%08x) != real magic(%08x)\r\n", magic, *(temp));
+		ret = false;
+	}
+
+	return ret;
+}
+
+
+static void ICACHE_FLASH_ATTR fb_block_unit_stat_init(block_t *block)
+{
+	int i = 0;
+
+	if (block->unit_stat != NULL) {
+		iw_free(block->unit_stat);
+		block->unit_stat = NULL;
+	}
+	block->unit_stat = iw_calloc(block->unit_num * sizeof(block_unit_stat_t), 1);
+	if(block->unit_stat == NULL) {
+		return;
+	}
+
+	for(i = 0; i < block->unit_num; i++) {
+		block->unit_stat[i].flash_offset = block->flash_offset + block->unit_size * i;
+		block->unit_stat[i].size = block->unit_size;
+		block->unit_stat[i].save_count = 0;
+		block->unit_stat[i].continue_failed = 0;
+		block->unit_stat[i].fail_count = 0;
+	}
+}
+
+static void ICACHE_FLASH_ATTR fb_block_cache_init(block_t *block)
+{
+	config_t *cache = NULL;
+	config_t *config = NULL;
+	int i = 0;
+
+	cache = block->cache;
+	for(i = 0; i < MF_MAX_CACHE_ENTRY; i++) {
+		config = &cache[i];
+		if (config->len > 0 && config->value != NULL) {
+			os_free(config->value);
+			config->value = NULL;
+		}
+		config->id = 0;
+		config->len = 0;
+	}
+}
+
+RS ICACHE_FLASH_ATTR fb_block_init(block_t *block)
+{
+	int index = 0;
+	UINT8 *buff = NULL;
+	config_head_t config_head;
+	config_t *cache = NULL;
+	u_int32_t addr = 0;
+	u_int32_t valid_unit = 0;
+
+	if (NULL == block)
+		return RS_ERROR;
+
+	block->valid = true;
+	block->dirty = false;
+	cache = block->cache;
+	fb_block_cache_init(block);
+	fb_block_unit_stat_init(block);
+
+	valid_unit = fb_valid_unit(block);
+	block->valid_unit = valid_unit;
+	addr = block->flash_offset + block->unit_size * block->valid_unit;
+
+	MF_TEST("%s magic=%08x flash_offset:%08x, max_id:%d, unit_size:%d, unit_num:%d, valid_unit=%08x\r\n",
+	        block->name, block->magic, block->flash_offset, block->max_id, block->unit_size, block->unit_num, block->valid_unit);
+
+
+	if (! fb_magic_valid(addr, block->magic)) {
+		MF_TEST("%s magic=%08x flash_offset:%08x, max_id:%d, unit_size:%d, unit_num:%d\r\n",
+			block->name, block->magic, block->flash_offset, block->max_id, block->unit_size, block->unit_num);
+		return RS_ERROR;
+	}
+
+
+	/* 从第二页开始存储配置信息，第一存储的是magic*/
+	index = FLASH_PAGE_SIZE;
+	while(1) {
+
+		if (index > block->unit_size) {
+			break;
+		}
+
+		spi_flash_read(addr + index, (uint32*)&config_head, MF_CONFIG_HEAD_SIZE);
+		/* flash读取，使用id判断退出 */
+		if (config_head.id >= block->max_id
+		    || config_head.len > MF_MAX_ITEM_SIZE) {
+			MF_TEST("config err.id=%d(max_id:%d) len=%d(max_len:%d)\r\n",
+			        config_head.id, block->max_id, config_head.len, MF_MAX_ITEM_SIZE);
+			break;
+		}
+
+		if(config_head.len == 0) {
+			index += MF_CONFIG_HEAD_SIZE;
+			continue;
+		}
+
+		buff = iw_calloc(config_head.len, 1);
+		if (!buff) {
+			MF_ERROR("calloc failed\n");
+			break;
+		}
+
+		index += MF_CONFIG_HEAD_SIZE;
+		spi_flash_read(addr + index, (UINT32*)buff, (UINT32)config_head.len);
+		cache[config_head.id].id = config_head.id;
+		cache[config_head.id].len = config_head.len;
+		cache[config_head.id].value = buff;
+
+		index += config_head.len;
+
+		MF_TEST("id=%d, len=%d\r\n", config_head.id, config_head.len);
+	}
+
+	MF_ERROR("%s init OK\r\n", block->name);
+	return RS_OK;
+}
+
+
+RS ICACHE_FLASH_ATTR fb_block_save(block_t *block)
+{
+	static u_int8_t page[FLASH_PAGE_SIZE];
+	static u_int8_t config_buf[MF_MAX_ITEM_SIZE];
+	u_int32_t config_len = 0, page_index = 0, len = 0, buf_index = 0;
+	int i = 0;
+	u_int32_t current_unit_addr, next_unit_addr;
+	u_int32_t next_unit, cur_unit;
+	block_unit_stat_t *cur_unit_stat, *next_unit_stat;
+	u_int32_t addr;
+	u_int32_t used_bytes = 0;
+
+	if (NULL == block)
+		return RS_ERROR;
+
+	MF_TEST("%s save\r\n", block->name);
+
+	/* 表示配置已经恢复出厂了，但还没有重启。其他地方触发了保存 */
+	if (block->valid == false) {
+		MF_INFO("%s is not valid\r\n", block->name);
+		return RS_OK;
+	}
+
+
+	if (block->dirty == false) {
+		MF_INFO("%s the dirty is false\r\n", block->name);
+		return RS_OK;
+	}
+
+	cur_unit = block->valid_unit;
+	next_unit = fb_next_unit(block);
+
+	cur_unit_stat = &block->unit_stat[cur_unit];
+	next_unit_stat = &block->unit_stat[next_unit];
+
+	current_unit_addr = cur_unit_stat->flash_offset;
+	next_unit_addr = next_unit_stat->flash_offset;
+
+	MF_TEST("cur_unit:%d, next_unit_id:%d\r\n", cur_unit, next_unit);
+	MF_TEST("current_unit_addr:%08x, next_unit_addr:%08x\r\n", current_unit_addr, next_unit_addr);
+	MF_TEST("cur_unit_stat. flash_offset:%08x, size:%d\r\n", cur_unit_stat->flash_offset, cur_unit_stat->size);
+	MF_TEST("next_unit_stat. flash_offset:%08x, size:%d\r\n", next_unit_stat->flash_offset, next_unit_stat->size);
+
+
+	fb_erase_unit(block, next_unit);
+
+
+	/* 第一页标记配置是否保存成功，后面写成功后，再来写*/
+	addr = next_unit_addr + FLASH_PAGE_SIZE;
+	for(i = 0; i < block->max_id; i++) {
+
+		if (block->cache[i].len == 0) {
+			continue;
+		}
+
+		MF_TEST("id:%d, len=%d\r\n", block->cache[i].id, block->cache[i].len);
+
+		fb_get_one_config(&block->cache[i], config_buf, &config_len);
+		if (used_bytes + config_len > block->unit_size - FLASH_PAGE_SIZE) {
+			MF_INFO("id(%d) len+head(%d)+used_bytes(%d) > unit_size(%d). ignore\r\n",
+			        block->cache[i].id, config_len, used_bytes, block->unit_size - FLASH_PAGE_SIZE);
+			continue;
+		}
+
+		used_bytes += config_len;
+
+		buf_index = 0;
+		while(config_len > 0) {
+			if (page_index < FLASH_PAGE_SIZE) {
+				len = min(config_len, FLASH_PAGE_SIZE - page_index);
+				os_memcpy(&page[page_index], &config_buf[buf_index], len);
+				page_index += len;
+				buf_index += len;
+				config_len -= len;
+				continue;
+			} else {
+				FB_WRITE_PAGE(next_unit_stat, addr, page);
+				page_index = 0;
+				addr += FLASH_PAGE_SIZE;
+			}
+		}
+	}
+
+
+	len = FLASH_PAGE_SIZE - page_index;
+	if (len > 0) {
+		os_memset(&page[page_index], 0xff, len);
+	}
+	FB_WRITE_PAGE(next_unit_stat, addr, page);
+	addr += FLASH_PAGE_SIZE;
+
+	/* 写头部标志,表示成功*/
+	os_memset(page, 0, sizeof(page));
+	os_memcpy(page, &block->magic, sizeof(block->magic));
+	FB_WRITE_PAGE(cur_unit_stat, next_unit_addr, page);
+
+	if (current_unit_addr != next_unit_addr) {
+		/* 上一份配置设成失效 */
+		spi_flash_erase_sector(current_unit_addr / FLASH_SECTOR_SIZE);
+	}
+
+	block->valid_unit = next_unit;
+	block->dirty = false;
+	next_unit_stat->continue_failed = 0;
+	next_unit_stat->save_count++;
+
+	return RS_OK;
+}
+
+
+void ICACHE_FLASH_ATTR fb_block_reset(block_t *block)
+{
+	int i = 0, j = 0;
+	u_int32_t sector_num;
+	u_int32_t addr;
+
+	if (NULL == block)
+		return;
+
+	MF_TEST("%s erase\r\n", block->name);
+
+	block->valid = false;
+
+	sector_num = block->unit_size / FLASH_SECTOR_SIZE;
+
+	for(i = 0; i < block->unit_num; i++) {
+		addr = block->flash_offset + i * block->unit_size;
+		for(j = 0; j < sector_num ; j++) {
+			MF_TEST("erase addr:%08x\r\n", addr + j * FLASH_SECTOR_SIZE);
+			spi_flash_erase_sector(addr / FLASH_SECTOR_SIZE + j);
+		}
+	}
+}
+
+
+config_t * ICACHE_FLASH_ATTR fb_get(block_t *block, u_int16_t id)
+{
+//	int i = 0;
+	config_t *config = NULL;
+
+	if (NULL == block)
+		return NULL;
+
+	if (id >= block->max_id ) {
+		MF_ERROR("error id=%d\n", id);
+		return NULL;
+	}
+
+	config = &block->cache[id];
+	if (config->len == 0) {
+		return NULL;
+	}
+
+	return config;
+}
+
+
+/*
+*	 save 变量表示，是否立即保存到flash中.如果不立即保存则需要调用者在外面条用fb_block_save来保存
+*/
+RS ICACHE_FLASH_ATTR fb_set(block_t *block, u_int16_t id, UINT8 *buff, u_int16_t len, bool save)
+{
+	u_int8_t *ptmp = NULL;
+	RS ret = RS_OK;
+
+	if (NULL == block || NULL == buff) {
+		return RS_ERROR;
+	}
+
+	if (id >= block->max_id) {
+		MF_ERROR("error id=%d\n", id);
+		return RS_ERROR;
+	}
+
+	if (len > MF_MAX_ITEM_SIZE - sizeof(config_head_t)) {
+		MF_ERROR("len(%d) > max len(%d)\r\n", len, MF_MAX_ITEM_SIZE - sizeof(config_head_t) );
+		return RS_ERROR;
+	}
+
+	if (block->cache[id].len != len) {
+		if (len == 0) {
+			ptmp = NULL;
+		} else {
+			ptmp = iw_calloc(len, 1);
+			if (!ptmp) {
+				MF_ERROR("calloc failed\n");
+				return RS_ERROR;
+			}
+		}
+
+		if (block->cache[id].value) {
+			iw_free(block->cache[id].value);
+			block->cache[id].value = NULL;
+		}
+
+		block->cache[id].value = ptmp;
+		block->cache[id].len = len;
+		block->cache[id].id = id;
+	}
+
+	/* value为NULL时, len =0, memcpy不会出错 */
+	os_memcpy(block->cache[id].value, buff, len);
+
+	block->dirty = true;
+
+	if (save) {
+		ret = fb_block_save(block);
+	}
+
+	return ret;
+}
+
+
+
+
+static void ICACHE_FLASH_ATTR fb_erase_unit(block_t *block, u_int32_t unit)
+{
+	u_int32_t addr;
+	u_int32_t sector_num;
+	int i = 0;
+
+	addr = block->flash_offset + unit * block->unit_size;
+
+	sector_num = block->unit_size / FLASH_SECTOR_SIZE;
+	for(i = 0; i < sector_num ; i++) {
+		spi_flash_erase_sector(addr / FLASH_SECTOR_SIZE + i);
+	}
+}
+
+static void ICACHE_FLASH_ATTR fb_get_one_config(config_t *config, u_int8_t *buf, u_int32_t *len)
+{
+	config_head_t head;
+	u_int32_t index = 0;
+
+	head.id = config->id;
+	head.len = config->len;
+
+	os_memcpy(&buf[index], &head, MF_CONFIG_HEAD_SIZE);
+	index += MF_CONFIG_HEAD_SIZE;
+
+	os_memcpy(&buf[index], config->value, config->len);
+	index += config->len;
+
+	*len = index;
+}
+
+
+bool ICACHE_FLASH_ATTR _flash_write(u_int32_t to, u_int32_t len, u_int8_t *value)
+{
+	SpiFlashOpResult ret = SPI_FLASH_RESULT_OK;
+	bool result = true;
+	u_int8_t *bak = NULL;
+
+	if (len == 0) {
+		return true;
+	}
+	while( len > 0) {
+		/* 开始地址不是在扇区的位置或者数据不满4K情况 */
+		if (len & (SPI_FLASH_SEC_SIZE - 1) || len < SPI_FLASH_SEC_SIZE) {
+			int piece_size;
+			unsigned int piece, bakaddr;
+
+			bak = (u_int8_t *)iw_calloc(SPI_FLASH_SEC_SIZE, 1);
+			if (bak == NULL) {
+				result = false;
+				goto end;
+			}
+
+			bakaddr = to & ~(SPI_FLASH_SEC_SIZE - 1);
+
+			if(spi_flash_read(bakaddr,
+			                  (uint32 *)bak, SPI_FLASH_SEC_SIZE) != SPI_FLASH_RESULT_OK) {
+				result = false;
+				goto end;
+			}
+
+
+			piece = to & (SPI_FLASH_SEC_SIZE - 1);
+			piece_size = min(len, SPI_FLASH_SEC_SIZE - piece);
+			memcpy(bak + piece, value, piece_size);
+
+			if(spi_flash_erase_sector(bakaddr / SPI_FLASH_SEC_SIZE) != SPI_FLASH_RESULT_OK) {
+				MF_TEST("spi_flash_erase_sector error\n");
+				result = false;
+				goto end;
+			}
+
+			ret = spi_flash_write(bakaddr, (uint32 *)bak, SPI_FLASH_SEC_SIZE);
+
+			iw_free(bak);
+			bak = NULL;
+			if (ret  != SPI_FLASH_RESULT_OK) {
+				result = false;
+				goto end;
+			}
+
+			value += piece_size;
+			to += piece_size;
+			len -= piece_size;
+		} else {
+			/* 地址在扇区开始位置，数据是4K */
+			spi_flash_erase_sector(to / SPI_FLASH_SEC_SIZE);
+
+			ret = spi_flash_write(to, (uint32 *)value, SPI_FLASH_SEC_SIZE);
+			if (ret  != SPI_FLASH_RESULT_OK) {
+				MF_TEST("spi_flash_write error\n");
+				result = false;
+				goto end;
+			}
+
+			to += SPI_FLASH_SEC_SIZE;
+			value += SPI_FLASH_SEC_SIZE;
+			len -= SPI_FLASH_SEC_SIZE;
+		}
+
+	}
+
+end:
+	if(bak) {
+		iw_free(bak);
+		bak = NULL;
+	}
+
+
+	return result;
+}
+
+bool ICACHE_FLASH_ATTR flash_write(u_int32_t start_addr, u_int32_t len, u_int8_t *value)
+{
+	int i;
+
+	for(i = 0; i < FLASH_WRITE_FAIL_MAX_NUM; i++) {
+		if (_flash_write(start_addr, len, value) == true) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+bool ICACHE_FLASH_ATTR flash_read_new(u_int32_t start_addr, u_int32_t len, u_int8_t *value)
+{
+	if (!value) {
+		return false;
+	}
+
+	if(spi_flash_read(start_addr,
+	                  (uint32 *)value, len) != SPI_FLASH_RESULT_OK) {
+		return false;
+	}
+
+	return true;
+}
+

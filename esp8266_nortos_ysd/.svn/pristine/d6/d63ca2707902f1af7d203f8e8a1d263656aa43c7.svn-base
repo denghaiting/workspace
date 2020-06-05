@@ -1,0 +1,725 @@
+/**************************************************************************
+**  Copyright (c) 2011 GalaxyWind, Ltd.
+**
+**  Project: 产测串口部分
+**  File:    iw_pt_uart.c
+**  Author:  xushengjian
+**  Date:    06/09/2015
+**
+**  Purpose:
+**
+**************************************************************************/
+
+
+/* Include files. */
+#include "iw_priv.h"
+#include "iw_api.h"
+#include "gpio.h"
+#include "user_interface.h"
+#include "iw_pt_uart.h"
+#include "iw_smartconfig.h"
+
+/* Macro constant definitions. */
+#define GPIO_NUM_8266 (16)
+#define WAITTIME_UART_SEND (5000)   //5毫秒超时
+#define CHECK_TIME_UART_SEND (200)  //波特率115200， 200微秒大概11字节。不带数据的应答字节为8字节
+#define	MAX_UART_INBD_STOU_TIME	(3) //发送给下位机的重试次数
+#define	CONFIG_CHECKSUM	(1)
+
+#define	Sync1 0xFF														/* 设置同步字1					*/
+#define	Sync2 0xAA													   	/* 设置同步字2					*/
+#define	Sync3 0x55													   	/* 设置同步字3					*/
+
+#define UAS_NONE 0
+#define UAS_SYN2 1
+#define UAS_SYN3 2
+#define UAS_HEADER 3
+#define UAS_DATA 4
+
+// TODO:
+/* 6621所有产品CMD使用的是同一识别空间，暂时不使用 */
+#define UART_CMD_PT_IS_ACTIVE      0XD6        /*串口检查是否激活*/
+#define UART_CMD_PT_RESET      0XD7        /*串口产测恢复出厂设置*/
+#define UART_CMD_PT_WIFI_SSID  0XD8           /*串口产测知道无线ssid连接*/
+#define UART_CMD_PT_WIFI_STATUS_QUERY  0XD9 /*串口产测无线连接状态查询*/
+#define UART_CMD_PT_LICENCE_ERASE  0XDA   /*串口产测证书擦除*/
+#define UART_CMD_PT_GPIO_SET  0XDB        /*串口产测gpio设置*/
+#define UART_CMD_PT_GPIO_QUERY 0XDC       /*串口产测gpio查询*/
+#define UART_CMD_PT_GPIO_SET_V2  0XDD         /*串口产测gpio设置,V2版本，调整成通用*/
+#define UART_CMD_PT_GPIO_QUERY_V2 0XDE       /*串口产测gpio查询,V2版本，调整成通用*/
+
+typedef enum {
+	SEND_PASSIVE,
+	SEND_ACTIVE
+} SEND_MODE;
+
+#define UART_RS_OK				0		/* 正常返回 */
+#define UART_RS_ERROR 			1		/* 失败 */
+#define UART_RS_INVALID_CHECKSUM 2		/* 接收校验失败 */
+#define UAET_RS_PARAM_TOOLONG	3		/* 参数过长超过缓存区大小 */
+
+/* Type definitions. */
+typedef struct {
+	u_int8_t state;
+	u_int8_t receive_request_id;
+	u_int8_t send_request_id;
+	// 输入缓冲区中，从哪片开始检查有数据
+	u_int8_t bd_parse_begin;
+	u_int16_t index;   //hdr index
+	u_int16_t index_read;	// 参数长度 param index
+
+	// 最后一次串口输入的时间
+	u_int32_t last_input_time;
+	// 当前从串口读入后的写位置
+	volatile pt_uart_bd_t *cur_bd;
+	pt_uart_bd_t bd[MAX_UART_IN_BD];
+
+	// 写串口时使用的缓冲区
+	u_int8_t out_head[8];
+	// 下位机最后一个应答的ID号
+	u_int8_t last_reply_id;
+	u_int8_t pad[2];
+} pt_uart_t;
+
+typedef struct {
+	pt_uart_t uart;
+} pt_uart_ctrl_t;
+
+typedef struct pt_gpio_s {
+	u_int32_t bitmap;
+	u_int32_t value;
+} pt_gpio_t;
+
+typedef struct pt_gpio_ret_s {
+	u_int8_t data;
+	u_int8_t pad[3];
+} pt_gpio_ret_t;
+
+
+/* Local function declarations. */
+void uart_pt_send(u_int8_t ret, u_int8_t cmd, u_int8_t send_mode, u_int8_t *data, u_int16_t param_len);
+
+/* Macro API definitions. */
+#define	VOF(_a, _i) ((u_int8_t *)(_a))[_i]
+//#define PT_DEBUG_
+#ifdef PT_DEBUG_
+#define PT_INFO(x...)  INFO(x)
+#define PT_DEBUG(x...) DEBUG(x)
+#define PT_ERROR(x...)  ERROR(x)
+#else
+#define PT_DEBUG(x...)
+#define PT_INFO(x...)
+#define PT_ERROR(x...) ERROR(x)
+#endif
+
+
+/* Global variable declarations. */
+pt_uart_ctrl_t *puart_pt;
+// TODO:
+#if 0
+/* GPIO产测要考虑GPIO_NUM_8266和此处针对8266修改 */
+static int test_gpio[] = {FUNC_GPIO0,
+                          FUNC_GPIO4, FUNC_GPIO5,
+                          FUNC_GPIO12, FUNC_GPIO13, FUNC_GPIO14, FUNC_GPIO15
+                         };
+#endif
+typedef struct {
+	u_int32_t   gpio_num;
+	u_int32_t   gpio_name;
+	u_int32_t   gpio_func;
+} gpio_test;
+
+static gpio_test gpio_test_s[] = {
+	//{0,  PERIPHS_IO_MUX_GPIO0_U, FUNC_GPIO0},
+	//{1,  PERIPHS_IO_MUX_U0TXD_U, FUNC_GPIO1},
+	//{2,  PERIPHS_IO_MUX_GPIO2_U, FUNC_GPIO2},
+	//{3,  PERIPHS_IO_MUX_U0RXD_U, FUNC_GPIO3},
+	{4,  PERIPHS_IO_MUX_GPIO4_U, FUNC_GPIO4},
+	//{5,  PERIPHS_IO_MUX_GPIO5_U, FUNC_GPIO5},
+	{5,  PERIPHS_IO_MUX_GPIO5_U, FUNC_GPIO5},
+	{12, PERIPHS_IO_MUX_MTDI_U,  FUNC_GPIO12},
+	{13, PERIPHS_IO_MUX_MTCK_U,  FUNC_GPIO13},
+	{14, PERIPHS_IO_MUX_MTMS_U,  FUNC_GPIO14},
+	//{15, PERIPHS_IO_MUX_MTDO_U,  FUNC_GPIO15},
+};
+
+int ispt_gpio = 0;
+bool test_ssid = false;
+void test_ssid_set(int test);
+void pt_do_uart_command( volatile pt_uart_bd_t *bd);
+void uart_pt_init(void);
+
+static void ICACHE_FLASH_ATTR uart_pt_ctrl_init(void)
+{
+	pt_uart_t *puart = &puart_pt->uart;
+
+	os_memset(puart_pt, 0, sizeof(*puart_pt));
+
+	puart->state = UAS_NONE;
+
+	puart->bd_parse_begin = 0;
+	puart->cur_bd = &puart->bd[0];
+	puart->last_reply_id = 0xff;
+	puart->last_input_time = 0;
+}
+
+static void ICACHE_FLASH_ATTR pt_do_wifi_query(void)
+{
+	u_int8_t state = 0;
+
+	if (is_wifi_up()) {
+		state = 1;
+	}
+
+	uart_pt_send(0, UART_CMD_PT_WIFI_STATUS_QUERY, SEND_PASSIVE, &state, sizeof(state));
+}
+
+static void ICACHE_FLASH_ATTR pt_do_licence_erase(void)
+{
+	u_int8_t state = 0;
+
+	spi_flash_erase_sector((u_int16_t)SPI_FLASH_LICENSE);
+	iw_sys_reboot();
+	uart_pt_send(0, UART_CMD_PT_LICENCE_ERASE, SEND_ACTIVE, &state, sizeof(state));
+}
+
+void ICACHE_FLASH_ATTR do_gpio_set_value(u_int32_t value)
+{
+	u_int32_t i, n, bit_value, gpio_no = 0;
+	u_int32_t set_mask = 0, clear_mask = 0, eable_mask = 0, mask = 0;
+
+	n = sizeof(gpio_test_s) / sizeof(gpio_test_s[0]);
+	for (i = 0; i < n; i++) {
+		gpio_no = gpio_test_s[i].gpio_num;
+		mask |= 1 << gpio_no;
+		bit_value = (value >> gpio_no) & 1;
+
+		set_mask |= bit_value << gpio_no;
+		clear_mask |= ((~bit_value) & 0x01) << gpio_no;
+		eable_mask |= 1 << gpio_no;
+
+		PIN_FUNC_SELECT(gpio_test_s[i].gpio_name, gpio_test_s[i].gpio_func);
+	}
+	eable_mask &= mask;
+	clear_mask &= mask;
+	set_mask   &= mask;
+
+	gpio_output_set(set_mask, clear_mask, eable_mask, 0);
+
+}
+
+void ICACHE_FLASH_ATTR pt_do_gpio_set(u_int8_t *data, u_int8_t len)
+{
+	u_int32_t value = 0;
+	u_int8_t  i = 0, state = 0;
+
+
+	if (len < sizeof(value)) {
+		PT_ERROR("error gpio len=%d\n", len);
+		return;
+	}
+
+	for (i = 0; i < len; i++) {
+		value |= data[i] << (8 * (3 - i));
+	}
+
+	PT_DEBUG("gpio set, value = %d\n", value);
+	do_gpio_set_value(value);
+
+	state = 1;
+
+	uart_pt_send(0, UART_CMD_PT_GPIO_SET, SEND_ACTIVE, &state, sizeof(state));
+}
+
+void ICACHE_FLASH_ATTR pt_do_gpio_get(void)
+{
+	int i, n;
+	u_int32_t ret;
+	u_int32_t value = 0;
+
+	n = sizeof(gpio_test_s) / sizeof(gpio_test_s[0]);
+
+	for(i = 0; i < n; i++) {
+		/* 8266 GPIO的输入检测功能，是缺省设置，无需使能 */
+		ret = GPIO_INPUT_GET(gpio_test_s[i].gpio_num);
+		value |= ret << gpio_test_s[i].gpio_num;
+		//DBGPRINT_MGMT(DEBUG_ERROR, "gpio %d get, value = %d\n", i, ret);
+	}
+	PT_DEBUG("gpio get, value = %d\n", value);
+	value = htonl(value);
+	uart_pt_send(0, UART_CMD_PT_GPIO_QUERY, SEND_PASSIVE,  (u_int8_t *)&value, sizeof(value));
+}
+
+/* 一次设置多个GPIO输出 */
+void ICACHE_FLASH_ATTR do_gpio_set_value_v2(u_int32_t bitmap, u_int32_t value)
+{
+	int i;
+	u_int32_t gpionum, value_bit, needset;
+
+	for(i = 0; i < GPIO_NUM_8266; i++) {
+		needset = (bitmap >> i) & 1;
+		if(needset) {
+			gpionum = i;
+			value_bit = (value >> i) & 1;
+			GPIO_DIS_OUTPUT(gpionum);
+			GPIO_OUTPUT_SET(gpionum, value_bit);
+			gpio_pin_intr_state_set(gpionum, GPIO_PIN_INTR_DISABLE);
+		}
+
+	}
+
+}
+
+
+void ICACHE_FLASH_ATTR pt_do_gpio_set_v2(u_int8_t *data, u_int8_t len)
+{
+	pt_gpio_t pt_gpio = {0};
+	pt_gpio_ret_t ret;
+	u_int8_t *pret = (u_int8_t *)&ret;
+
+	if (len < sizeof(pt_gpio_t)) {
+		PT_ERROR("error gpio len=%d\n", len);
+		return;
+	}
+	os_memcpy(&pt_gpio, data, len);
+	//pt_gpio = (pt_gpio_t *)data;
+	pt_gpio.bitmap = ntohl(pt_gpio.bitmap);
+	pt_gpio.value = ntohl(pt_gpio.value);
+
+	do_gpio_set_value_v2(pt_gpio.bitmap, pt_gpio.value);
+
+	PT_DEBUG( "gpio set bitmap[0x%08x] value[0x%08x]\n", pt_gpio.bitmap, pt_gpio.value);
+	os_memset(pret, '\0', sizeof(pt_gpio_ret_t));
+	ret.data = 1;
+	uart_pt_send(0, UART_CMD_PT_GPIO_SET_V2, SEND_ACTIVE, pret, sizeof(ret));
+}
+
+
+void ICACHE_FLASH_ATTR pt_do_gpio_get_v2(u_int8_t *data, u_int8_t len)
+{
+
+	pt_gpio_t pt_gpio_parm = {0};
+	pt_gpio_t pt_gpio_ret;
+	pt_gpio_t *pret = &pt_gpio_ret;
+	int i, ret;
+	u_int32_t gpionum, value, needget;
+	u_int32_t bitmap;
+
+	if (len < sizeof(pt_gpio_t)) {
+		PT_ERROR("error gpio len=%d\n", len);
+		return;
+	}
+	os_memset(pret, '\0', sizeof(pt_gpio_t));
+	value = 0;
+	//pt_gpio_parm = (pt_gpio_t *)data;
+	os_memcpy(&pt_gpio_parm, data, len);
+	bitmap = ntohl(pt_gpio_parm.bitmap);
+	PT_DEBUG( "gpio want get bitmap[0x%08x] \n", bitmap);
+
+	for(i = 0; i < GPIO_NUM_8266; i++) {
+		needget = (bitmap >> i) & 1;
+		if(needget) {
+			gpionum = i;
+			/* 8266 GPIO的输入检测功能，是缺省设置，无需使能 */
+			ret = GPIO_INPUT_GET(gpionum);
+			value |= ret << i;
+			//BSP_GPIOIntDisable(gpionum);
+		}
+	}
+
+	PT_DEBUG( "gpio  get, value = %d\n", value);
+	pret->bitmap = htonl(bitmap);
+	pret->value = htonl(value);
+	uart_pt_send(0, UART_CMD_PT_GPIO_QUERY_V2, SEND_PASSIVE,  (u_int8_t *)pret, sizeof(pt_gpio_t));
+}
+
+void ICACHE_FLASH_ATTR wifi_ssid_config(u_int8_t *data, u_int8_t len)
+{
+	iw_sys_info_t *cfg = (iw_sys_info_t *)&piw_priv->iw_sys;
+	struct station_config stcfg;
+	char *ssid, *pwd;
+	int ssid_len;
+	u_int8_t state = 1;
+
+	if (len < 4 || len > MAX_SSIDPW_SSID_LEN + MAX_SSIDPW_PW_LEN + 1) {
+		PT_ERROR("Bad wifi len = %d\n", len);
+		return;
+	}
+
+	data[len] = '\0';
+	ssid = (char *)data;
+	ssid_len = os_strlen(ssid);
+
+	pwd = "";
+	if (ssid_len < len - 1) {
+		pwd = (char *)&data[os_strlen(ssid) + 1];
+	}
+
+	exit_smartconfig();
+
+	wifi_station_disconnect();
+	os_delay_us(10 * 10 * 1000);
+	os_strcpy((char *)cfg->ssid, (char *)ssid);
+	os_strcpy((char *)cfg->passwd, (char *)pwd);
+	os_strcpy((char *)stcfg.ssid, (char *)ssid);
+	os_strcpy((char *)stcfg.password, (char *)pwd);
+	wifi_station_set_config(&stcfg);
+	wifi_station_connect();
+	//未明确8266如何对外显示wifi状态
+
+	PT_DEBUG("ssid=%s pwd=%s ssidlen=%d len=%u\n",
+	          ssid, pwd, os_strlen(ssid), os_strlen(pwd));
+	uart_pt_send(0, UART_CMD_PT_WIFI_SSID, SEND_PASSIVE,  &state, sizeof(state));
+}
+
+
+void ICACHE_FLASH_ATTR get_active_repaly(void)
+{
+	u_int8_t state = 0;
+
+	if (dev_is_active()) {
+		state = 1;
+	} else {
+		state = 0;
+	}
+
+	uart_pt_send(0, UART_CMD_PT_IS_ACTIVE, SEND_PASSIVE,  (u_int8_t *)&state, sizeof(state));
+}
+
+void ICACHE_FLASH_ATTR pt_do_reset(void)
+{
+	u_int8_t state = 1;
+
+	uart_pt_send(0, UART_CMD_PT_RESET, SEND_PASSIVE,  (u_int8_t *)&state, sizeof(state));
+	iw_sys_reset();
+}
+
+
+
+void ICACHE_FLASH_ATTR pt_do_uart_command( volatile pt_uart_bd_t *bd)
+{
+	PT_DEBUG("pt cmd:0x%02x rec_id:0x%02x parm_len:%d ret:%d\n",
+	         bd->head.cmd, bd->head.rid, bd->param_len, bd->head.ret);
+	test_ssid_set(true);
+
+	switch (bd->head.cmd) {
+		case UART_CMD_PT_IS_ACTIVE:
+			get_active_repaly();
+			break;
+		case UART_CMD_PT_RESET:
+			pt_do_reset();
+			break;
+		case UART_CMD_PT_WIFI_SSID:
+			wifi_ssid_config((u_int8_t *)bd->param, (u_int8_t) bd->param_len);
+			break;
+		case UART_CMD_PT_WIFI_STATUS_QUERY:
+			pt_do_wifi_query();
+			break;
+		case UART_CMD_PT_LICENCE_ERASE:
+			pt_do_licence_erase();
+			break;
+		case UART_CMD_PT_GPIO_SET:
+			pt_do_gpio_set((u_int8_t *)bd->param, (u_int8_t) bd->param_len);
+			break;
+		case UART_CMD_PT_GPIO_QUERY:
+			pt_do_gpio_get();
+			break;
+		case UART_CMD_PT_GPIO_SET_V2:
+			ispt_gpio = 1;
+			pt_do_gpio_set_v2((u_int8_t *)bd->param, (u_int8_t) bd->param_len);
+			break;
+		case UART_CMD_PT_GPIO_QUERY_V2:
+			ispt_gpio = 1;
+			pt_do_gpio_get_v2((u_int8_t *)bd->param, (u_int8_t) bd->param_len);
+			break;
+
+	}
+}
+
+static void ICACHE_FLASH_ATTR uart_pt_parse(int event, void *data, int data_len)
+{
+	u_int8_t i;
+	pt_uart_bd_t *bd;
+	pt_uart_t *puart = &puart_pt->uart;
+
+	for (i = 0; i < MAX_UART_IN_BD; i++) {
+		bd = &puart->bd[puart->bd_parse_begin];
+		if ( ! bd->has_data ) {
+			continue;
+		}
+
+		puart->bd_parse_begin = (puart->bd_parse_begin + 1) % MAX_UART_IN_BD;
+		pt_do_uart_command(bd);
+		bd->has_data = false;
+	}
+}
+
+void ICACHE_FLASH_ATTR uart_pt_send(u_int8_t ret, u_int8_t cmd, u_int8_t send_mode, u_int8_t *data, u_int16_t param_len)
+{
+	u_int8_t checksum = 0, param_sum = 0;
+	u_int16_t i = 0;
+	u_int8_t count, rid, max_try = MAX_UART_INBD_STOU_TIME;
+	pt_uart_t *puart = &puart_pt->uart;
+
+	if (param_len > UART_BUFF_MAX_SIZE) {
+		return;
+	}
+
+	// 填充发送头部
+	puart->out_head[i++] = Sync1;
+	puart->out_head[i++] = Sync2;
+
+	if(send_mode == SEND_PASSIVE) {
+		rid = puart->out_head[i++] = puart->receive_request_id | 0x80;
+	} else {
+		rid = puart->out_head[i++] = puart->send_request_id;
+		puart->send_request_id = (rid + 1) & 0x7F;
+	}
+
+	puart->out_head[i++] = (cmd);
+	puart->out_head[i++] = (u_int8_t)(param_len >> 8);
+	puart->out_head[i++] = (u_int8_t)(param_len);
+	puart->out_head[i++] = (ret);
+	puart->out_head[i] = 0;
+
+	/* 计算头部校验和。校验和包含同步码 */
+	for (i = 0; i < sizeof(puart->out_head) - 1; i++) {
+		checksum ^= puart->out_head[i];
+	}
+
+	checksum = (u_int8_t)((checksum ^ ((checksum & 0xF) << 4)) & 0xF0);
+
+	/* 计算参数部分校验和 */
+	for (i = 0; i < param_len; i++) {
+		param_sum ^= data[i];
+	}
+
+	checksum |= (u_int8_t)((param_sum ^ (param_sum >> 4)) & 0x0F);
+	puart->out_head[sizeof(puart->out_head) - 1] = checksum;
+
+	count = 1;
+	do {
+		// 写头
+		for (i = 0; i < sizeof(puart->out_head); i++) {
+			uart_tx_one_char(UART0, puart->out_head[i]);
+		}
+		// 写数据
+		for (i = 0; i < param_len; i++) {
+			uart_tx_one_char(UART0, data[i]);
+		}
+		if (send_mode == SEND_PASSIVE)
+			break;
+
+		count++;
+		/* 等待直到获取了串口响应 */
+		for (i = 0; i < (WAITTIME_UART_SEND / CHECK_TIME_UART_SEND); i++) {
+			os_delay_us(CHECK_TIME_UART_SEND);
+			if (puart->last_reply_id == rid)
+				break;
+		}
+	} while (count <= max_try && puart->last_reply_id != rid);
+}
+
+static u_int8_t  ICACHE_FLASH_ATTR check_head_pt(void)
+{
+#ifdef CONFIG_CHECKSUM
+	u_int8_t checksum, i;
+	pt_uart_t *puart = &puart_pt->uart;
+
+	checksum = Sync1 ^ Sync2;
+	for (i = 0; i < sizeof(puart->cur_bd->head) - 1; i++)
+		checksum ^= VOF(&puart->cur_bd->head, i);
+
+	checksum = (checksum ^ ((checksum) << 4)) & 0xF0;
+
+	return (puart->cur_bd->head.checksum & 0xF0) == checksum ? 1 : 0;
+#else
+	return 1;
+#endif
+}
+
+static u_int8_t ICACHE_FLASH_ATTR check_param_pt(void)
+{
+#ifdef CONFIG_CHECKSUM
+
+	u_int8_t checksum;
+	u_int16_t i;
+	pt_uart_t *puart = &puart_pt->uart;
+
+	for (checksum = i = 0; i < puart->cur_bd->param_len; i++)
+		checksum ^= puart->cur_bd->param[i];
+
+	checksum = (checksum ^ (checksum >> 4)) & 0xF;
+
+	return (puart->cur_bd->head.checksum & 0xF) == checksum ? 1 : 0;
+#else
+	return 1;
+#endif
+}
+
+static void ICACHE_FLASH_ATTR uart_pt_callback(void *data)
+{
+	u_int8_t value;
+	pt_uart_hdr_t *hdr;
+	pt_uart_t *puart = &puart_pt->uart;
+
+	// 长时间无数据输入，而之前有收到部分报文，做丢弃处理
+	if (get_up_msec() - puart->last_input_time > 300) {
+		if (puart->state != UAS_NONE) {
+			PT_ERROR("uart_pt_callback drop prev uart: wait %u, stat=%u, idx_read=%u, param_len=%u\n",
+			         get_up_msec() - puart->last_input_time, puart->state, puart->index_read, puart->cur_bd->param_len);
+			puart->index = puart->index_read = puart->state = 0;
+		}
+	}
+
+	value = *(u_int8_t *)data;
+	PT_DEBUG("value = %d\r\n", value);
+	PT_DEBUG("pt value=%02x puart->state=%u\n", value, puart->state);
+	/* done 之后还没来得及处理，又轮到这个bd接收了 */
+	if (puart->cur_bd->has_data) {
+		PT_ERROR( "pt uart bd full\n");
+		goto err_out;
+	}
+
+	puart->last_input_time = get_up_msec();
+
+	hdr = (pt_uart_hdr_t *)&puart->cur_bd->head;
+
+	switch (puart->state) {
+		case UAS_NONE:
+			if (value == Sync1) {
+				puart->state = UAS_SYN2;
+			}
+			break;
+
+		case UAS_SYN2:
+			if (value == Sync2) {
+				puart->state = UAS_HEADER;
+			} else
+				goto err_out;
+			break;
+
+		case UAS_HEADER:
+			VOF(hdr, puart->index++) = value;
+			if (puart->index >= sizeof(*hdr)) {
+				puart->state = UAS_DATA;
+				puart->index = 0;
+				puart->cur_bd->param_len = ntohs(hdr->param_len);
+				PT_DEBUG("param_len=%u\n", puart->cur_bd->param_len);
+				if (hdr->param_len == 0)
+					goto done;
+				// 接收数据过长
+				if (puart->cur_bd->param_len > UART_BUFF_MAX_SIZE) {
+					uart_pt_send(UAET_RS_PARAM_TOOLONG, hdr->cmd, SEND_PASSIVE, NULL, 0);
+					PT_ERROR("parm_len %d is too long,err\n", puart->cur_bd->param_len);
+					goto err_out;
+				}
+
+				// 头部校验和
+				if (!check_head_pt()) {
+					PT_ERROR("HDR CRC err, cmd=0x%02x\n", hdr->cmd);
+					goto err_out;
+				}
+			}
+			break;
+
+		case UAS_DATA:
+			// 数据过多，溢出
+			if (puart->index_read >= UART_BUFF_MAX_SIZE) {
+				goto err_out;
+			}
+			puart->cur_bd->param[puart->index_read++] = value;
+			if (puart->index_read >= puart->cur_bd->param_len)
+				goto done;
+			break;
+	}
+
+	return;
+
+done:
+	// 参数校验和
+	if (!check_param_pt()) {
+		PT_ERROR("DATA CRC err, cmd=0x%02x\n", hdr->cmd);
+		goto err_out;
+	}
+	PT_DEBUG("UART done: rid recv=%u, prev=%u, cmd=0x%02x\n", hdr->rid, puart->receive_request_id, hdr->cmd);
+
+	if ((hdr->rid & 0x80) != 0) {
+		//串口被动 应答报文
+		if(hdr->ret == 0) {
+			puart->last_reply_id = (hdr->rid & 0x7F);
+		}
+		if(hdr->param_len == 0) {
+			goto err_out;
+		}
+	} else {
+		//串口主动上报报文
+		puart->receive_request_id = hdr->rid;
+	}
+
+	puart->cur_bd->has_data = true;
+	value = puart->cur_bd - &puart->bd[0];
+	puart->cur_bd = &puart->bd[(value + 1) % MAX_UART_IN_BD];
+
+err_out:
+	// TODO:
+	/* 此处err处理是否遗漏状态处理 */
+	puart->index = puart->index_read = puart->state = 0;
+}
+
+int ICACHE_FLASH_ATTR ucd_parse_uart_cmd_timer(void *t)
+{
+	uart_pt_parse(0, NULL, 0);
+	return 0;
+}
+
+void ICACHE_FLASH_ATTR uart_pt_init(void)
+{
+	puart_pt = iw_malloc(sizeof(*puart_pt));
+	if(!puart_pt) {
+		return;
+	}
+
+	uart_pt_ctrl_init();
+	/* 定时器轮训触发事件，处理串口报文 */
+	/* 10ms轮询一次查看串口数据是否收完了 */
+	iw_timer_set(TID_UART_PARSE, 10, 1, ucd_parse_uart_cmd_timer, NULL);
+}
+
+//exit事实无人调用
+//当内存不够时可释放
+void uart_pt_exit(void)
+{
+	iw_timer_delete(TID_UART_PARSE);
+	if (puart_pt) {
+		iw_free(puart_pt);
+		puart_pt = NULL;
+	}
+}
+
+static rs_t ICACHE_FLASH_ATTR iw_uart_2pretest(iw_event_info_t *INOUT_info)
+{
+	uart_pt_callback(INOUT_info->cu.cp);
+	return RS_OK;
+}
+
+void ICACHE_FLASH_ATTR iw_uart_pretest_init(void)
+{
+	uart_pt_init();
+	/* 收到一个串口字节 */
+	iw_event_register(IW_EV_UARTR_2PRETEST, iw_uart_2pretest);
+}
+
+//被中断函数调用，需要长驻扎内存
+//这个函数是串口产测的标志，通过串口发送ssid和pwd
+bool  is_test_ssid(void)
+{
+	return test_ssid;
+}
+
+void ICACHE_FLASH_ATTR test_ssid_set(int test)
+{
+	test_ssid = (bool)test;
+}
+
+

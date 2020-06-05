@@ -1,0 +1,66 @@
+#ifndef __IWUOS_PRIV_HEADER__
+#define __IWUOS_PRIV_HEADER__
+
+struct _iw_priv_s;
+typedef struct _iw_priv_s iw_priv_t;
+struct _ucd_s;
+typedef struct _ucd_s ucd_t;
+
+
+#include "iw_platform.h"
+#include <stdarg.h>
+#include "licence.h"
+#include "ds_proto.h"
+#include "udp_ctrl.h"
+#include "iw_api.h"
+#include "iw_net.h"
+#include "iw_dev.h"
+#include "iw_lan_srv.h"
+#include "iw_mem.h"
+#include "iw_debug.h"
+#include "iw_event.h"
+#include "iw_thread_timer.h"
+#include "iw_uptime.h"
+#include "iw_sys_time.h"
+#include "iw_flash.h"
+#include "iw_ia.h"
+#include "md5.h"
+#include "aes.h"
+#include "mu_type.h"
+#include "iw_lib.h"
+#include "iw_flash.h"
+#include "uuid.h"
+#include "esp8266_lede.h"
+#include "iw_user_config.h"
+#include "iw_func_support.h"
+
+
+typedef struct{
+	iw_client_t client;
+	u_int32_t sid;
+	struct stlc_list_head link;
+}iw_client_priv_t;
+
+typedef struct _iw_priv_s{
+	iw_sys_info_t iw_sys;
+	
+	//dns 连接描述符
+	void *dnsconn;
+	// 连接服务器连接描述符
+	void *devconn;
+	// 设备监听描述
+	void *srvconn;
+	// 网络发现监听描述符
+	void *ijcfgconn;
+	
+	bool event_isinited;
+
+	//网络通讯的动作
+	iw_event_hash_t event_hash;
+	//对象，这个在框架里暂时没有用
+	iw_obj_hash_t obj_hash;
+}iw_priv_t;
+
+extern iw_priv_t *piw_priv;
+
+#endif

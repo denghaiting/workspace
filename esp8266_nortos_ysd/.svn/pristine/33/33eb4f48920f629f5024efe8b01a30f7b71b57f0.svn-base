@@ -1,0 +1,98 @@
+/**************************************************************************
+**  Copyright (c) 2013 GalaxyWind, Ltd.
+**
+**  Project: 魔灯
+**  File:    user_main.c
+**  Author:  fangfuhan
+**  Date:    04/08/2016
+**
+**  Purpose:
+**    入口函数.
+**************************************************************************/
+
+/* Include files. */
+#include "iw_reset_already_finish.h"
+#include "ets_sys.h"
+#include "osapi.h"
+#include "driver/uart.h"
+#include "user_interface.h"
+#include "ds_proto.h"
+#include "udp_ctrl.h"
+#include "iw_api.h"
+#include "iw_priv.h"
+#include "iw_smartconfig.h"
+#include "licence.h"
+#include "iw_sys_time.h"
+
+
+/* Macro constant definitions. */
+
+
+
+/* Type definitions. */
+
+/* Local function declarations. */
+
+
+/* Macro API definitions. */
+//#define USERIN_DEBUG_
+#ifdef USERIN_DEBUG_
+#define USERIN_INFO(x...)   INFO(x)
+#define USERIN_DEBUG(x...)  DEBUG(x)
+#define USERIN_ERROR(x...)  ERROR(x)
+#else
+#define USERIN_DEBUG(x...)
+#define USERIN_INFO(x...)	INFO(x)
+#define USERIN_ERROR(x...)  ERROR(x)
+#endif
+
+
+/******************************************************************************
+ * FunctionName : user_init
+ * Description  : entry of user application, init user function here
+ * Parameters   : none
+ * Returns      : none
+*******************************************************************************/
+void user_init(void)
+{
+    iw_init_t wii;
+
+    uart_init(BIT_RATE_115200, BIT_RATE_115200);
+	
+    USERIN_INFO("SDK version:%s\n", system_get_sdk_version());
+
+    if(wifi_get_opmode() != STATION_MODE){	
+		volatile int ret = wifi_set_opmode(STATION_MODE);
+		ret = ret;
+        USERIN_INFO("set wifi to station mode return %d\n", ret);
+    }
+	
+	if (RS_OK == lcc_read()) {//保存数据时要判断active标志， 所以放到前面先初始化一下
+		if (false == wifi_set_macaddr(STATION_IF, g_dev.mac)) {
+			USERIN_ERROR("set mac failed\n");
+		}
+	}
+
+	//必须放在配置初始化的最前面
+	conf_fix_init();
+
+	//检查一下是否需要继续恢复出厂
+	check_reset_state();
+
+	conf_wifi_init();
+    conf_user_init();
+    conf_dev_init();
+    
+	uuid_read();
+
+	os_strcpy(wii.desc, "iwos_dev");
+	os_strcpy(wii.vendor, "galaxywind");
+
+	//内存系统的一些值的初始化
+	init_mu_sys_config();	
+	
+	// iwos 初始化
+	iw_sys_init(&wii);
+	
+}
+

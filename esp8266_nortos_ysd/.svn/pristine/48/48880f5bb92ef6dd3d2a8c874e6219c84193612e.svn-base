@@ -1,0 +1,1522 @@
+/******************************************************************************
+ * Copyright 2013-2014 Espressif Systems (Wuxi)
+ *
+ * FileName: user_plug.c
+ *
+ * Description: plug demo's function realization
+ *
+ * Modification history:
+ *     2014/5/1, v1.0 create this file.
+*******************************************************************************/
+
+#include "iw_priv.h"
+#include "iw_func_support.h"
+#include "iw_dev_timer.h"
+#include "md5.h"
+#include "iw_ntp_time_syn.h"
+#include "iw_func_support.h"
+#include "iw_sys_time.h"
+#include "iw_linkage_conf.h"
+#include "domain.h"
+#include "mul_port.h"
+#include "ice_domain.h"
+#include "domain.h"
+#include "iw_lib.h"
+
+#define UCD_MAX_RAND  (12000) //单位为秒
+
+char ucd_rcv_buf[MAX_UC_PKT_SIZE];
+ucd_t ucd;
+extern ucc_proc_t ucdc_proc[UCCS_MAX];
+
+//#define CLIENT_DEBUG_
+#ifdef CLIENT_DEBUG_
+#define	CLIENT_DEBUG(fmt...) DEBUG(fmt)
+#define	CLIENT_INFO(fmt...)  INFO(fmt)
+#define	CLIENT_ERROR(fmt...) ERROR(fmt)
+#else
+#define	CLIENT_DEBUG(fmt...)
+#define	CLIENT_INFO(fmt...)
+#define	CLIENT_ERROR(fmt...) ERROR(fmt)
+#endif
+
+static int ucdc_keeplive_timer(void  *cp);
+static int ucdc_send_timer(void *arg);
+void ucdc_lpc_send(ucdc_session_t *s);
+extern void pkt_free(void *pkt);
+int  ucdc_send_pkt(ucdc_session_t *s, pkt_t *pkt);
+rs_t iw_init_dev_udp(iw_priv_t *piw);
+extern void srand(unsigned int seed);
+extern int rand(void);
+extern void uc_set_default_time_param(uc_time_param_all_t *time_param, uc_time_param_all_t *time_param_net);
+void  ucdc_lpc_set(ucdc_session_t *s, pkt_t *pkt);
+bool  ucdc_lpc_is_need_send(ucdc_session_t *s);
+void  ucdc_lpc_enable(ucdc_session_t *s, bool enable);
+void  ucdc_lpc_clean(ucdc_session_t *s);
+void ucdc_set_status(ucdc_session_t *s, int status);
+
+void ICACHE_FLASH_ATTR uc_hdr_order(ucph_t *hdr)
+{
+	if(hdr == NULL){
+		CLIENT_ERROR("uc_hdr_order hdr=NULL\r\n");
+		return;
+	}	
+	
+	hdr->client_sid = ntohl(hdr->client_sid);
+	hdr->device_sid = ntohl(hdr->device_sid);
+
+	hdr->command = ntohs(hdr->command);
+	hdr->param_len = ntohs(hdr->param_len);
+}
+
+#define LOCALTIME_YEAR_BASE 1970
+static void ICACHE_FLASH_ATTR fill_local_time(uc_time_t *uct)
+{
+	time_t now;
+	struct tm tmp;
+
+	if(uct == NULL){
+		CLIENT_ERROR("fill_local_time uct=NULL\r\n");
+		return;
+	}
+
+	//时间不准，以后再说；
+	now = get_sec();
+	localtimes_withtone(now,&tmp);
+
+	uct->year = tmp.tm_year;
+	uct->month = tmp.tm_mon;
+	uct->day = tmp.tm_mday;
+	uct->hour = tmp.tm_hour;
+	uct->minute = tmp.tm_min;
+	uct->second = tmp.tm_sec;
+	uct->timezone = get_local_timezone();
+
+	uct->year = htons(uct->year);
+
+}
+
+
+
+void ICACHE_FLASH_ATTR ucdc_reset_send(ucdc_session_t *s)
+{
+	pkt_t *pkt, *next;
+
+	if(s == NULL){
+		CLIENT_ERROR("ucdc_reset_send s=NULL\r\n");
+		return;
+	}
+	
+	stlc_list_for_each_entry_safe(pkt_t, pkt, next, &s->send_list, link) {
+		stlc_list_del(&pkt->link);
+		pkt_free(pkt);
+	}
+
+
+	if (s->last_pkt) {
+		pkt_free(s->last_pkt);
+		s->last_pkt = NULL;
+	}
+
+	s->send_retry = 0;
+	iw_timer_delete(TID_UCDC_SEND);
+}
+
+static bool ICACHE_FLASH_ATTR is_reset_pkt(ucph_t *hdr)
+{
+	uc_keeplive_reply_t *kr;
+
+	if (hdr == NULL || hdr->command != CMD_UDP_KEEPLIVE)
+		return false;
+
+	kr = get_net_ucp_payload(hdr, uc_keeplive_reply_t);
+
+	return (kr->action == UCA_RESET);
+}
+
+rs_t ICACHE_FLASH_ATTR ucdc_enc_pkt(ucdc_session_t *s, pkt_t *pkt)
+{
+	ucph_t *hdr;
+	
+	if(s == NULL || pkt == NULL){
+		return RS_ERROR;
+	}
+	
+	hdr = (ucph_t *)pkt->data;
+
+	if (s->select_enc == UC_ENC_AES128) {
+		int len;
+		u_int8_t pad;
+
+		len = pkt->total - ucph_hdr_plain_size;
+		pad = AES128_EKY_LEN - (len & (AES128_EKY_LEN - 1));
+		len += pad;
+
+		memset(pkt->data + pkt->total, pad, pad);
+
+		enc_block((u_int8_t *)BOFP(pkt->data, ucph_hdr_plain_size), len, s->key);
+		pkt->total = len + ucph_hdr_plain_size;
+
+		hdr->encrypt = 1;
+	} else {
+		hdr->encrypt = 0;
+	}
+
+	return RS_OK;
+}
+
+
+/*
+	发送请求报文，需要定时重发，重发时间递增
+*/
+rs_t ICACHE_FLASH_ATTR ucdc_request_add(ucdc_session_t *s, pkt_t *pkt)
+{
+	if(s == NULL || pkt == NULL){
+		CLIENT_ERROR("ucdc_request_add s=NULL OR SEND_LIST IS EMPTY\r\n");
+		return RS_ERROR;
+	}	
+	
+	if (s->status == UCCS_ESTABLISH) {
+		if (ucdc_enc_pkt(s, pkt) != RS_OK) {
+			pkt_free(pkt);
+			return RS_ERROR;
+		}
+		s->my_request_id++;
+	}
+
+	if (stlc_list_empty(&s->send_list)) {
+		s->send_retry = 0;
+		stlc_list_add_tail(&pkt->link, &s->send_list);
+		iw_timer_set(TID_UCDC_SEND, 0, 0, ucdc_send_timer, (void*)s);
+	} else {
+		stlc_list_add_tail(&pkt->link, &s->send_list);
+	}
+
+
+	iw_timer_delete(TID_UCDC_KEEPALIVE);
+
+	return RS_OK;
+}
+
+/*
+	删除头节点，触发下一节点的发送
+*/
+void ICACHE_FLASH_ATTR ucdc_request_del(ucdc_session_t *s)
+{
+	pkt_t *pkt;
+
+	if (s == NULL || stlc_list_empty(&s->send_list))
+		CLIENT_ERROR("ucdc_request_del s=NULL OR SEND_LIST IS EMPTY\r\n");
+		return;
+
+	pkt = (pkt_t *)stlc_list_entry(s->send_list.next, pkt_t, link);
+	stlc_list_del(&pkt->link);
+	pkt_free(pkt);
+
+	iw_timer_delete(TID_UCDC_SEND);
+
+	if (stlc_list_empty(&s->send_list)) {
+		if (s->status == UCCS_ESTABLISH) {
+			iw_timer_set(TID_UCDC_KEEPALIVE, TIME_N_SECOND(s->time_param_cur->keeplive), 0, ucdc_keeplive_timer, (void *)s);
+		}
+		return;
+	}
+
+	s->send_retry = 0;
+	iw_timer_set(TID_UCDC_SEND, 0, 0, ucdc_send_timer, (void*)s);
+}
+
+
+static int ICACHE_FLASH_ATTR ucdc_keeplive_timer(void  *cp)
+{
+	ucdc_session_t  *s;
+	pkt_t *pkt;
+	uc_keeplive_request_t *kr;
+
+	if(cp == NULL){
+		CLIENT_ERROR("ucdc_keeplive_timer cp=NULL\r\n");
+		return 0;
+	}	
+
+	s = (ucdc_session_t *)cp;
+
+	//s = (ucdc_session_t *)CL_THREAD_ARG(t);
+	//s->t_keeplive = NULL;
+	// 不着急设置下一个定时器，等本次的发完毕后，在ucdc_request_del中设置
+	//CL_THREAD_TIMER_ON(MASTER, s->t_keeplive, ucdc_keeplive_timer, (void *)s, 0);
+
+	// 发送队列目前还有报文等待发送，没必要再发保活报文了
+	if ( ! stlc_list_empty(&s->send_list) )
+		return 0;
+
+	pkt = uc_pkt_new(CMD_UDP_KEEPLIVE, sizeof(uc_keeplive_request_t),
+	                 true, s->is_enc, 0,	s->client_sid, s->device_sid, s->my_request_id);
+	if (pkt == NULL) {
+		CLIENT_ERROR("no buffer for packets.\n");
+		return 0;
+	}
+	kr = get_ucp_payload(pkt, uc_keeplive_request_t);
+	kr->action = UCA_REQUEST;
+
+	ucdc_request_add(s, pkt);
+
+	return 0;
+}
+
+/*****************************************
+            发送报文相关函数
+ *****************************************/
+// 应答报文不需要重传,可靠传输链表里的定时发送函数，不需要记录最后一次发送缓存
+RS ICACHE_FLASH_ATTR ucdc_send_pkt_no_cach(ucdc_session_t *s, pkt_t *pkt)
+{
+	int n;
+
+	if(s == NULL || pkt == NULL){
+		CLIENT_ERROR("ucdc_send_pkt_no_cach ERROR\n");	
+		return RS_ERROR;
+	}
+
+	n = iw_udp_send(s->ip, s->port, (char *)pkt->data, pkt->total, s->conn);
+	if (n <= 0) {
+		CLIENT_ERROR("%s send pkt failed: ip=%u.%u.%u.%u, port=%d, want=%d, send=%d\n",
+		      s->name, IP_SHOW(s->ip), s->port, pkt->total, n);
+	} else {
+		//默认打开报文收发打印
+#ifdef CLIENT_DEBUG_
+		ucph_t *hdr;
+		hdr = (ucph_t *)pkt->data;
+		CLIENT_DEBUG("ucdc_send_pkt_no_cach %s send ip=%u.%u.%u.%u, port=%d, len=%d: cmd=%u, action=%u, req=%d, enc=%d, csid=%08x, dsid=%08x, rid=%u, my_request_id=%u\n",
+		      s->name, IP_SHOW(s->ip), s->port, n,
+		      pkt->cmd, *((u_int8_t *)(hdr + 1)), hdr->request, hdr->encrypt,
+		      ntohl(hdr->client_sid), ntohl(hdr->device_sid), hdr->request_id, s->my_request_id);
+#endif
+	}
+
+	return 0;
+}
+
+
+/***************************
+	IDLE
+ ***************************/
+
+/*
+*	next_time 为0时，以前没有解析过，第一次需要解析。
+*	
+*/
+static bool need_resolve_domain(u_int32_t next_time)
+{
+	u_int32_t up_time = get_up_sec();
+
+	if (0 == next_time)
+		return true;
+
+	if (next_time < up_time)
+		return true;
+
+	return false;
+}
+
+static bool resolv_domain_ok(void)
+{
+	u_int32_t ip = domain_get_ip();
+
+	if (0 == ip)
+		return false;
+
+	//ERROR("resolv_domain_ok IP= [%u:%u:%u:%u]", IP_SHOW(ip));
+	
+	return true;
+}
+
+
+static int ICACHE_FLASH_ATTR idle_timer(void *cp)
+{
+
+	iw_sys_info_t info;
+
+	ucdc_session_t *s;
+
+	if(cp == NULL){
+		CLIENT_ERROR("idle_timer cp=NULL\r\n");
+		return 0;
+	}	
+
+	s = (ucdc_session_t *)cp;
+	iw_sys_info_get(&info);
+
+	if(!info.is_linkup || !info.ip) {// || !info.dns) {
+		CLIENT_ERROR("idle_timer linkup:%d info.ip:%lu info.dns:%lu\r\n",
+		          info.is_linkup, info.ip, info.dns);
+		return 0;
+	}
+
+	/*
+		1.判断是否要重新进行域名解析。
+		2.域名没有解析完，则不切换到下个状态机状态。
+	*/
+
+	if (need_resolve_domain(s->next_resolve_time)){
+		domain_clear_ip();
+		dn_start();
+		s->next_resolve_time = get_up_sec() + 3600;	
+		return 0;
+	}
+	
+	if (!resolv_domain_ok()){
+		return 0;
+	}
+	CLIENT_ERROR("connect server!!\r\n");
+	s->ip = domain_get_next_ip();
+	
+	get_serverport(s);
+	
+	INFO("server:%d.%d.%d.%d:%d\r\n", IP_SHOW(s->ip), s->port);
+
+	iw_timer_delete(TID_UCDC_IDLE);
+	//IP4_ADDR(&ip, 117, 7, 11, 10);
+	//s->ip = ip.addr;
+
+	ucdc_set_status(s, UCCS_AUTH_REQ);
+
+	return 0;
+}
+
+RS ICACHE_FLASH_ATTR do_tlv_local_time(ucdc_session_t *s, uc_tlv_t *tlv)
+{
+	uc_time_t *t;
+
+	if (tlv->len < sizeof(uc_time_t)) {
+		CLIENT_ERROR("%s ignore local time len=%u\n", s->name, tlv->len);
+		return RS_ERROR;
+	}
+
+	t = (uc_time_t *)tlv_val(tlv);
+	//t->year = ntohs(t->year);
+	CLIENT_DEBUG("%s ignore local time len=%u\n", s->name, tlv->len);
+	ntp_from_ice(t);
+
+	return RS_OK;
+}
+
+static int ICACHE_FLASH_ATTR do_tlv_time_param(ucdc_session_t *s, uc_tlv_t *tlv)
+{
+	if (tlv->len < sizeof(uc_time_param_all_t)) {
+		CLIENT_ERROR("%s ignore time param len=%u\n", s->name, tlv->len);
+		return RS_ERROR;
+	}
+
+	if (os_memcmp(tlv_val(tlv), &s->time_param_net, sizeof(uc_time_param_all_t)) == 0) {
+		return RS_OK;
+	}
+
+	os_memcpy(&s->time_param_net, tlv_val(tlv), sizeof(uc_time_param_all_t));
+	os_memcpy(&s->time_param, tlv_val(tlv), sizeof(uc_time_param_all_t));
+	s->time_param.dev.die = ntohs(s->time_param.dev.die);
+	s->time_param.lan.die = ntohs(s->time_param.lan.die);
+	s->time_param.wan_front.die = ntohs(s->time_param.wan_front.die);
+	s->time_param.wan_background.die = ntohs(s->time_param.wan_background.die);
+
+	CLIENT_DEBUG("%s update time paramt: retry = %u, %u, %u (100ms), keeplive=%us, die=%us\n",
+	             s->name,
+	             s->time_param_cur->retry_100ms[0], s->time_param_cur->retry_100ms[1], s->time_param_cur->retry_100ms[2],
+	             s->time_param_cur->keeplive, s->time_param_cur->die);
+
+	return RS_OK;
+}
+
+
+static void ICACHE_FLASH_ATTR do_keeplive(ucdc_session_t *s, ucph_t *hdr)
+{
+	uc_keeplive_reply_t *kr;
+	uc_tlv_t *tlv;
+	int remain;
+
+	kr = get_net_ucp_payload(hdr, uc_keeplive_reply_t);
+	if (kr->action == UCA_RESET) {
+		CLIENT_INFO("%s reset by peer\n", s->name);
+		ucdc_set_status(s, UCCS_AUTH_REQ);
+		return;
+	}
+
+	if (kr->action != UCA_REPLY) {
+		CLIENT_DEBUG("%s ignore keeplive action=%u\n", kr->action);
+		return;
+	}
+
+	tlv = (uc_tlv_t *)(kr + 1);
+
+//	remain = hdr->param_len - ucph_hdr_len(hdr) - sizeof(uc_keeplive_reply_t);
+	remain = hdr->param_len  - sizeof(uc_keeplive_reply_t);
+	tlv->type = ntohs(tlv->type);
+	tlv->len = ntohs(tlv->len);
+
+	while (remain >= (int)sizeof(uc_tlv_t) && remain >= (int)(sizeof(uc_tlv_t) + tlv->len)) {
+		switch (tlv->type) {
+			case UCT_TIME_PARAM:
+				do_tlv_time_param(s, tlv);
+				break;
+		}
+		remain -= sizeof(uc_tlv_t) + tlv->len;
+		tlv = tlv_next(tlv);
+		if (remain >= sizeof(uc_tlv_t)) {
+			tlv->type = ntohs(tlv->type);
+			tlv->len = ntohs(tlv->len);
+		}
+	}
+}
+
+
+static int ICACHE_FLASH_ATTR ucdc_send_timer(void *arg)
+{
+	int n;
+	ucdc_session_t *s;
+	pkt_t *pkt;
+
+	s = (ucdc_session_t *)arg;
+
+	if (s->send_retry >= 3)
+		n = 2;
+	else
+		n = s->send_retry;
+	n = s->time_param_cur->retry_100ms[n] * 100;
+	iw_timer_set(TID_UCDC_SEND, n, 0, ucdc_send_timer, (void*)s);
+	s->send_retry++;
+
+	pkt = (pkt_t *)stlc_list_entry(s->send_list.next, pkt_t, link);
+
+	n = iw_udp_send(s->ip, s->port, (char *)pkt->data, pkt->total, piw_priv->devconn);
+	if (n <= 0) {
+		CLIENT_INFO("%s send pkt failed: ip=%u.%u.%u.%u, port=%d, want=%d, send=%d\n",
+		            s->name, IP_SHOW(s->ip), s->port, pkt->total, n);
+	} else {
+#ifdef CLIENT_DEBUG_
+		ucph_t *hdr;
+		hdr = (ucph_t *)pkt->data;
+		CLIENT_DEBUG("----->>>> ucdc_send_timer %s send ip=%u.%u.%u.%u, port=%d, len=%d: cmd=%d, action=%u, req=%d, enc=%d, csid=%08x, dsid=%08x, rid=%u, my_request_id=%u\n",
+		             s->name, IP_SHOW(s->ip), s->port, n,
+		             pkt->cmd, *((u_int8_t *)(hdr + 1)), hdr->request, hdr->encrypt,
+		             ntohl(hdr->client_sid), ntohl(hdr->device_sid), hdr->request_id, s->my_request_id);
+		//mem_dump("send", pkt->data, n);
+#endif
+	}
+
+	return 0;
+}
+
+static void ICACHE_FLASH_ATTR ses_clone_set(ucdc_session_t *s, bool clone)
+{
+	s->dev->is_clone = clone ? 1 : 0;
+}
+
+
+static void ICACHE_FLASH_ATTR do_auth_result(ucdc_session_t *s, ucph_t *hdr, uc_auth_result_t *rs)
+{
+	MD5_CTX ctx;
+	ucd_t *dev = s->dev;
+	uc_tlv_t *tlv;
+	int remain;
+
+	rs->select_enc = ntohs(rs->select_enc);
+	rs->err_num = ntohs(rs->err_num);
+
+	if (rs->err_num != 0) {
+		CLIENT_ERROR("%s auth failed, result=%d\n", s->name, rs->err_num);
+		//置上克隆机标志
+		if (rs->err_num == ERR_CLONE) {
+			s->dev->is_clone = 1;
+		}
+		ucdc_set_status(s, UCCS_ERROR);
+		return;
+	}
+
+	s->link_server_time = get_sec();
+	s->my_request_id = s->peer_request_id = 0;
+	s->peer_last_request_id = 0;
+	s->select_enc = rs->select_enc;
+	// 认证请求方的加密秘钥使用 MD5(rand1 + rand2 + 验证凭证 + 验证凭证)
+	if ((s->select_enc & UC_ENC_AES128) == UC_ENC_AES128) {
+		s->is_enc = true;
+		Md5_Init(&ctx);
+		Md5_Update(&ctx, s->rand1, sizeof(s->rand1));
+		Md5_Update(&ctx, s->rand2, sizeof(s->rand2));
+		Md5_Update(&ctx, dev->preshare_key, sizeof(dev->preshare_key));
+		Md5_Update(&ctx, dev->preshare_key, sizeof(dev->preshare_key));
+		Md5_Final(s->key, &ctx);
+	} else {
+		s->is_enc = false;
+	}
+	remain = hdr->param_len - sizeof(uc_auth_result_t);
+	tlv = (uc_tlv_t *)(rs + 1);
+	tlv->type = ntohs(tlv->type);
+	tlv->len = ntohs(tlv->len);
+	while (remain >= (int)(sizeof(uc_tlv_t)) && remain >= (int)(sizeof(uc_tlv_t) + tlv->len)) {
+		switch (tlv->type) {
+			case UCT_VENDOR:
+				//do_tlv_vendor(s, tlv);
+				break;
+			case UCT_LOCAL_TIME:
+				do_tlv_local_time(s, tlv);
+				break;
+			case UCT_TIME_PARAM:
+				do_tlv_time_param(s, tlv);
+				break;
+#ifdef HAS_PKT_CLONE
+			case UCT_CLONE_PKT_SEND_ENABLE:
+				if (tlv->len >= sizeof(u_int8_t)) {
+					ucd.is_clone_pkt_enable = *tlv_val(tlv);
+				}
+				break;
+#endif
+			default:
+				break;
+		}
+		remain -= sizeof(uc_tlv_t) + tlv->len;
+		tlv = tlv_next(tlv);
+		if (remain >= sizeof(uc_tlv_t)) {
+			tlv->type = ntohs(tlv->type);
+			tlv->len = ntohs(tlv->len);
+		}
+	}
+
+	ucdc_set_status(s, UCCS_ESTABLISH);
+}
+
+
+static void ICACHE_FLASH_ATTR ucdc_off_all_timer(ucdc_session_t *s)
+{
+	iw_timer_delete(TID_UCDC_SEND);
+	iw_timer_delete(TID_UCDC_KEEPALIVE);
+	iw_timer_delete(TID_UCDC_DIE);
+	iw_timer_delete(TID_UCDC_IDLE);
+}
+
+
+static int ICACHE_FLASH_ATTR ucdc_check_reply_id(ucdc_session_t *s, ucph_t *reply)
+{
+	pkt_t *pkt;
+	ucph_t *request;
+
+	if (stlc_list_empty(&s->send_list)) {
+		CLIENT_DEBUG("%s ignore reply pkt: no request in send list.\n", s->name);
+		return RS_ERROR;
+	}
+
+	pkt = (pkt_t *)stlc_list_entry(s->send_list.next, pkt_t, link);
+	request = (ucph_t *)(pkt + 1);
+	if (request->request_id != reply->request_id) {
+		CLIENT_DEBUG("%s ignore reply pkt: my request id=%u, but %u in pkt.\n",
+		             s->name, request->request_id, reply->request_id);
+		return RS_ERROR;
+	}
+
+	return RS_OK;
+}
+
+
+static int ICACHE_FLASH_ATTR ucdc_check_request_id(ucdc_session_t *s, ucph_t *request)
+{
+	if (request->request_id == s->peer_request_id) {
+		if (!ucdc_lpc_is_need_send(s)) {
+			return RS_OK;
+		}
+		CLIENT_DEBUG("recv ucdc the same pkt request_id=%u\n", request->request_id);
+		ucdc_lpc_send(s);
+		return RS_ERROR;
+	} else if (request->request_id == (u_int8_t)(s->peer_request_id + 1)) {
+		// good, update to next
+		CLIENT_INFO("%s update rquest id to %u\n", s->name, request->request_id);
+		s->peer_request_id++;
+		return RS_OK;
+	}
+
+	CLIENT_INFO("%s ignore request pkt: reply id=%u, but local is %u.\n",
+	            s->name, request->request_id, s->peer_request_id);
+
+	return RS_ERROR;
+}
+
+
+static void ICACHE_FLASH_ATTR ucdc_do_udp_ctrl(ucdc_session_t *s, ucph_t *hdr)
+{
+	ucp_ctrl_t *uc;
+	ucp_ctrl_t *uc_reply;
+	ucp_obj_t *uobj;
+	pkt_t * pkt = NULL;
+	u_int8_t *ptr, *end;
+
+	uc = get_net_ucp_payload(hdr, ucp_ctrl_t);
+	ptr = (u_int8_t*)&uc[1];
+	end = ptr + hdr->param_len - sizeof(ucp_ctrl_t);
+
+	uci_send_index = 0;
+	uci_proc_num = 0;
+
+	for (; ptr < end; ptr += sizeof(ucp_obj_t) + uobj->param_len) {
+		uobj = (ucp_obj_t *)ptr;
+		ucp_obj_order(uobj);
+		do_udp_ctrl_core(s, true, uc->action, uobj, (u_int8_t *)&uobj[1]);
+	}
+
+	if(hdr->request == 0) {
+		CLIENT_DEBUG("request = 0, no need send a request to server\n");
+		return;
+	}
+
+	//准备发送
+	pkt = uc_pkt_new(CMD_UDP_CTRL, uci_send_index + sizeof(ucp_ctrl_t),
+	                 false, s->is_enc, 0, s->client_sid, ucd.client.device_sid, s->peer_request_id);
+
+	if (pkt == NULL) {
+		CLIENT_ERROR("no buffer for packets.\n");
+		return ;
+	}
+
+	uc_reply = get_ucp_payload(pkt, ucp_ctrl_t);
+	uc_reply->action = uc->action;
+	uc_reply->count = uci_proc_num;
+	memcpy((u_int8_t *)(uc_reply + 1), uci_send_buf, uci_send_index);
+
+	//这里服务器与客户端加密时加密方法来源判断不一样
+	if (ucdc_enc_pkt(s, pkt) != RS_OK) {
+		pkt_free(pkt);
+		return;
+	}
+
+	ucdc_send_pkt(s, pkt);
+	DEBUG_LINE();
+}
+
+
+static void ICACHE_FLASH_ATTR ucdc_estab_do_request(ucdc_session_t *s, ucph_t *hdr)
+{
+	if (ucdc_check_request_id(s, hdr) != RS_OK)
+		return;
+	//如果走到这里，表示是另一个包了
+	ucdc_lpc_clean(s);
+	ucdc_lpc_enable(s, true);
+
+	switch (hdr->command) {
+		case CMD_UDP_CTRL:
+			ucdc_do_udp_ctrl(s, hdr);
+			break;
+		case CMD_UDP_KEEPLIVE:
+			do_keeplive(s, hdr);
+			break;
+		case CMD_UDP_NOTIFY:
+			break;
+		case CMD_UDP_BIND_PHONE:
+			break;
+		default:
+			CLIENT_INFO("%s at %s ignore reqeust pkt cmd=%u\n", s->name, ucdc_proc[s->status].name, hdr->command);
+			break;
+	}
+
+	s->peer_last_request_id = s->peer_request_id;
+
+}
+
+
+
+/***************************
+	AUTH REQUEST
+ ***************************/
+
+
+static int ICACHE_FLASH_ATTR auth_req_die(void *cp)
+{
+	ucdc_session_t *s = (ucdc_session_t *)cp;
+
+	CLIENT_INFO("%s UCCS_AUTH_REQ die\n", s->name);
+
+    /* 连接服务器失败，换端口连接 */
+    get_serverport(s);
+	s->idle_time = get_random() % UCD_MAX_RAND + DFL_UC_IDLE_TIME;
+	CLIENT_ERROR("Switch port(%d), idle_time:%u\r\n", s->port, s->idle_time);
+	
+
+	ucdc_set_status(s, UCCS_IDLE);
+	return 0;
+}
+
+
+/***************************
+	AUTH ANSWER
+ ***************************/
+
+static int ICACHE_FLASH_ATTR auth_answer_die(void *cp)
+{
+	ucdc_session_t *s = (ucdc_session_t *)cp;
+
+	CLIENT_INFO("%s UCCS_AUTH_ANSWER die\n", s->name);
+
+	ucdc_set_status(s, UCCS_AUTH_REQ);
+	return 0;
+}
+
+/***************************
+	ESTABLISH
+ ***************************/
+
+static int ICACHE_FLASH_ATTR ucdc_estab_die(void *cp)
+{
+	ucdc_session_t *s = (ucdc_session_t *)cp;
+
+	CLIENT_ERROR("%s UCCS_ESTABLISH die\n", s->name);
+
+	ucdc_set_status(s, UCCS_AUTH_REQ);
+
+	return 0;
+}
+static void ICACHE_FLASH_ATTR ucdc_exception_check(ucdc_session_t *s)
+{
+#define MAX_EXCEPTION_COUNT		2
+
+	if (++s->exception_num > MAX_EXCEPTION_COUNT) {
+		CLIENT_INFO("ucdc excepion, reselect sock port\n");
+		iw_init_dev_udp(piw_priv);
+		s->exception_num = 0;
+		ucdc_set_status(s, UCCS_IDLE);
+	} else {
+		CLIENT_INFO("ucdc_exception_check, exception_num=%d\n", s->exception_num);
+	}
+}
+
+#if 1
+static void ICACHE_FLASH_ATTR ucdc_idle_into(ucdc_session_t *s)
+{
+	ucdc_reset_send(s);
+	s->client_sid = 0;
+	s->device_sid = 0;
+	s->my_request_id = 0;
+	s->peer_request_id = 0;
+	ucdc_off_all_timer(s);
+
+	if(0 == s->idle_time){
+		s->idle_time = DFL_UC_IDLE_TIME;		
+	}
+	iw_timer_set(TID_UCDC_IDLE, TIME_N_MSECOND(s->idle_time), 1, idle_timer, (void*)s);
+
+}
+
+static void ICACHE_FLASH_ATTR ucdc_idle_out(ucdc_session_t *s)
+{
+	ucdc_reset_send(s);
+	ucdc_exception_check(s);
+}
+
+static void ICACHE_FLASH_ATTR ucdc_idle_proc(ucdc_session_t *s)
+{
+	// do none
+}
+
+static void ICACHE_FLASH_ATTR ucdc_auth_req_into(ucdc_session_t *s)
+{
+	pkt_t *pkt;
+	uc_auth_request_t *ar;
+	u_int32_t r1;
+
+	// reset
+	ucdc_reset_send(s);
+	s->client_sid = 0;
+	s->device_sid = 0;
+	s->my_request_id = 0;
+	s->peer_request_id = 0;
+
+	iw_timer_delete(TID_UCDC_DIE);
+	iw_timer_set(TID_UCDC_DIE, TIME_N_SECOND(s->time_param_cur->die), 0, auth_req_die, (void *)s);
+
+	// create new rand
+	srand(get_sec());
+	r1 = rand();
+	memcpy(s->rand1, &r1, sizeof(s->rand1));
+	memset(s->rand2, 0, sizeof(s->rand2));
+
+	// send auth.request
+	pkt = uc_pkt_new(CMD_UDP_AUTH, sizeof(uc_auth_request_t),
+	                 true, false, 0,	0, 0, 0);
+	if (pkt == NULL) {
+		CLIENT_ERROR("no buffer for packets.\n");
+		ucdc_set_status(s, UCCS_IDLE);
+		return;
+	}
+	ar = get_ucp_payload(pkt, uc_auth_request_t);
+	ar->action = UCA_REQUEST;
+	os_memcpy(ar->rand1, s->rand1, sizeof(ar->rand1));
+	ar->sn = ntoh_ll(s->dev->sn);
+	os_memcpy(ar->my_uuid, s->uuid, sizeof(ar->my_uuid));
+
+	fill_local_time(&ar->time);
+
+	ucdc_request_add(s, pkt);
+}
+
+
+static void ICACHE_FLASH_ATTR ucdc_auth_req_out(ucdc_session_t *s)
+{
+	ucdc_reset_send(s);
+}
+
+static void ICACHE_FLASH_ATTR do_auth_redirect(ucdc_session_t *s, uc_auth_redirect_t *rd)
+{
+	rd->ip = ntohl(rd->ip);
+	rd->port = ntohs(rd->port);
+	CLIENT_INFO("%s redirect to ip=%u.%u.%u.%u port=%u\n",
+		s->name, IP_SHOW(rd->ip), rd->port);
+
+	s->ip = rd->ip;
+	s->port = rd->port;
+
+	ucdc_set_status(s, UCCS_AUTH_REQ);
+}
+
+static void ICACHE_FLASH_ATTR do_auth_question(ucdc_session_t *s, uc_auth_question_t *qs)
+{
+	uc_auth_answer_t *ans;
+	pkt_t *pkt;
+	MD5_CTX ctx;
+	u_int16_t param_len = 0;
+	uc_tlv_t *tlv;
+	dev_info_t dev_info;
+
+	ucdc_set_status(s, UCCS_AUTH_ANSWER);
+
+	os_memcpy(s->rand2, qs->rand2, sizeof(s->rand2));
+
+	param_len = sizeof(uc_tlv_t) + sizeof(dev_info) + sizeof(uc_auth_answer_t);
+#ifdef LINKAGE_SUPPORT
+	param_len += sizeof(uc_tlv_t) + sizeof(linkage_info_t);
+#endif
+	
+	pkt = uc_pkt_new(CMD_UDP_AUTH, param_len,
+	                 true, false, 0, s->client_sid, s->device_sid, 0);
+	if (pkt == NULL) {
+		CLIENT_ERROR("no buffer for packets.\n");
+		ucdc_set_status(s, UCCS_IDLE);
+		return;
+	}
+	ans = get_ucp_payload(pkt, uc_auth_answer_t);
+	ans->action = UCA_ANSWER;
+	ans->support_enc = htons(UC_ENC_NONE);
+
+	// MD5(token1 + token2 + password_md5)
+	Md5_Init(&ctx);
+	Md5_Update(&ctx, s->rand1, sizeof(s->rand1));
+	Md5_Update(&ctx, s->rand2, sizeof(s->rand2));
+	Md5_Update(&ctx, s->dev->preshare_key, sizeof(s->dev->preshare_key));
+	Md5_Final(ans->answer, &ctx);
+
+	//uuid尽量存下
+	if (os_memcmp(qs->your_uuid, s->uuid, MU_DEV_UUID_LEN)) {
+		if (RS_OK == uuid_write(qs->your_uuid, MU_DEV_UUID_LEN)) {
+			CLIENT_ERROR("uuid_write successed\n");
+			os_memcpy(s->uuid, qs->your_uuid, sizeof(s->uuid));
+		} else {
+			CLIENT_ERROR("uuid_write failed\n");
+			ans->answer[0]++;
+			s->uuid_write_failed = true;
+		}
+	}
+
+	fill_local_time(&ans->time);
+
+	tlv = (uc_tlv_t *)(ans + 1);
+	
+#ifdef LINKAGE_SUPPORT
+	{
+		linkage_info_t *linkage_info = NULL;
+
+		tlv->type = htons(UCT_LINK_SUPPORT);
+		tlv->len = htons(sizeof(linkage_info_t));
+		linkage_info = (linkage_info_t *)tlv_val(tlv);
+		linkage_info->home_id = htonl(get_home_id());
+		linkage_info->reset_count = htons(lc_get_reset_count());
+		linkage_info->pad[0] = 0;
+		linkage_info->pad[1] = 0;
+		tlv = tlv_n_next(tlv);
+	}
+#endif
+
+
+	//带上设备信息
+	os_memset((u_int8_t *)&dev_info, 0, sizeof(dev_info));
+	get_dev_info(&dev_info);
+
+	tlv->type = htons(UCT_DEV_INFO);
+	tlv->len = htons(sizeof(dev_info));
+
+	os_memcpy(tlv_val(tlv), (void *)&dev_info, sizeof(dev_info));
+
+	ucdc_request_add(s, pkt);
+}
+
+
+
+static void ICACHE_FLASH_ATTR do_auth_result_err(ucdc_session_t *s, ucph_t *hdr, uc_auth_result_t *rs)
+{
+	rs->select_enc = ntohs(rs->select_enc);
+	rs->err_num = ntohs(rs->err_num);
+
+	if (rs->err_num != 0) {
+		CLIENT_ERROR("%s auth failed, result=%d\n", s->name, rs->err_num);
+		//置上克隆机标志
+		if (rs->err_num == ERR_CLONE) {
+			CLIENT_ERROR("clone err %u\n", rs->err_num);
+			ses_clone_set(s, true);
+			//60s后再连服务器
+			s->idle_time = CLONE_UC_IDLE_TIME;
+			ucdc_set_status(s, UCCS_IDLE);
+		}
+
+		return;
+	}
+
+}
+
+
+static void  ICACHE_FLASH_ATTR ucdc_auth_req_proc(ucdc_session_t *s)
+{
+	ucph_t *hdr;
+	uc_auth_redirect_t *rd;
+	uc_auth_question_t *qs;
+	uc_auth_result_t *rs;
+
+	hdr = (ucph_t *)s->rcv_buf;
+
+	if (is_reset_pkt(hdr)) {
+		CLIENT_INFO("%s reset by peer\n", s->name);
+		ucdc_set_status(s, UCCS_AUTH_REQ);
+		return;
+	}
+	if (hdr->command != CMD_UDP_AUTH) {
+		CLIENT_ERROR("%s at %s ignore pkt cmd=%u\n", s->name, ucdc_proc[s->status].name, hdr->command);
+		return;
+	}
+
+	rd = get_net_ucp_payload(s->rcv_buf, uc_auth_redirect_t);
+	switch (rd->action) {
+		case UCA_REDIRECT:
+			do_auth_redirect(s, rd);
+			break;
+
+		case UCA_QUESTION:
+			s->client_sid = hdr->client_sid;
+			s->device_sid = hdr->device_sid;
+			qs = get_net_ucp_payload(s->rcv_buf, uc_auth_question_t);
+			do_auth_question(s, qs);
+			break;
+		case UCA_RESULT:
+			rs = get_net_ucp_payload(s->rcv_buf, uc_auth_result_t);
+			do_auth_result_err(s, hdr, rs);
+		default:
+			CLIENT_DEBUG("%s at %s ignore pkt action=%u\n", s->name, ucdc_proc[s->status].name, rd->action);
+			return;
+	}
+}
+
+
+static void ICACHE_FLASH_ATTR ucdc_auth_answer_into(ucdc_session_t *s)
+{
+	iw_timer_delete(TID_UCDC_DIE);
+	iw_timer_set(TID_UCDC_DIE, TIME_N_SECOND(s->time_param_cur->die), 0, auth_answer_die, (void *)s);
+}
+
+static void ICACHE_FLASH_ATTR ucdc_auth_answer_out(ucdc_session_t *s)
+{
+	ucdc_reset_send(s);
+}
+
+static void ICACHE_FLASH_ATTR ucdc_auth_answer_proc(ucdc_session_t *s)
+{
+	ucph_t *hdr;
+	uc_auth_result_t *rs;
+
+	hdr = (ucph_t *)s->rcv_buf;
+
+	if (is_reset_pkt(hdr)) {
+		CLIENT_ERROR("%s reset by peer\n", s->name);
+		ucdc_set_status(s, UCCS_AUTH_REQ);
+		return;
+	}
+
+	if (hdr->command != CMD_UDP_AUTH) {
+		CLIENT_DEBUG( "%s at %s ignore pkt cmd=%u\n", s->name, ucdc_proc[s->status].name, hdr->command);
+		return;
+	}
+	rs = get_net_ucp_payload(s->rcv_buf, uc_auth_result_t);
+	switch (rs->action) {
+		case UCA_RESULT:
+			do_auth_result(s, hdr, rs);
+			break;
+		default:
+			CLIENT_DEBUG("%s at %s ignore pkt action=%u\n", s->name, ucdc_proc[s->status].name, rs->action);
+			return;
+	}
+}
+
+static void ICACHE_FLASH_ATTR ucdc_estab_into(ucdc_session_t *s)
+{
+    /* 连接成功，保存端口 */
+    save_serverport(s);
+	
+	iw_timer_delete(TID_UCDC_DIE);
+	iw_timer_set(TID_UCDC_DIE, TIME_N_SECOND(s->time_param_cur->die), 0, ucdc_estab_die, (void *)s);
+
+	// 先快速发一个keeplive，获取一些参数
+	iw_timer_delete(TID_UCDC_KEEPALIVE);
+	iw_timer_set(TID_UCDC_KEEPALIVE, 0, 0, ucdc_keeplive_timer, (void *)s);
+	//这里表示连上服务器，可以开始计算时间了
+
+
+	piw_priv->iw_sys.server_connect_time = get_sec();
+	ucdc_lpc_clean(s);
+	ucdc_lpc_enable(s, false);
+}
+
+static void ICACHE_FLASH_ATTR ucdc_estab_out(ucdc_session_t *s)
+{
+	ucdc_reset_send(s);
+	ucdc_off_all_timer(s);
+
+	piw_priv->iw_sys.server_connect_time = 0;
+}
+
+static void ICACHE_FLASH_ATTR ucdc_estab_proc(ucdc_session_t *s)
+{
+	ucph_t *hdr;
+
+	hdr = (ucph_t *)s->rcv_buf;
+
+	// check if it's keeplive.reset
+	if (is_reset_pkt(hdr)) {
+		CLIENT_INFO("%s reset by peer\n", s->name);
+		ucdc_set_status(s, UCCS_AUTH_REQ);
+		return;
+	}
+
+	// process request packet
+	if (hdr->request) {
+		ucdc_estab_do_request(s, hdr);
+		return;
+	}
+
+	/*
+		bellow process reply packet
+	*/
+#if 1
+	if (ucdc_check_reply_id(s, hdr) != RS_OK) {
+		return;
+	}
+#endif
+
+	switch (hdr->command) {
+		case CMD_UDP_CTRL:
+			ucdc_do_udp_ctrl(s, hdr);
+			break;
+		case CMD_UDP_KEEPLIVE:
+			do_keeplive(s, hdr);
+			break;
+		case CMD_UDP_NOTIFY:
+			break;
+		case CMD_UDP_BIND_PHONE:
+			break;
+		default:
+			CLIENT_DEBUG("%s at %s ignore reply pkt cmd=%u\n", s->name, ucdc_proc[s->status].name, hdr->command);
+			break;
+	}
+
+	// 删除掉已经应答的报文
+	ucdc_request_del(s);
+
+	// 在处理完报文再设置死亡时间。因为可能修改了死亡时间参数
+	if (s->status == UCCS_ESTABLISH) {
+		iw_timer_delete(TID_UCDC_DIE);
+		iw_timer_set(TID_UCDC_DIE, TIME_N_SECOND(s->time_param_cur->die), 0, ucdc_estab_die, (void *)s);
+	}
+}
+
+static void ICACHE_FLASH_ATTR ucdc_error_into(ucdc_session_t *s)
+{
+	ucdc_reset_send(s);
+	ucdc_off_all_timer(s);
+
+	//连接服务器掉线
+	piw_priv->iw_sys.server_connect_time = 0;
+
+	//uuid写失败时状态机重置一下
+	if (s->uuid_write_failed) {
+		s->uuid_write_failed = false;
+	}
+
+	//1.2.0版本存在认证时随机数不对，导致认证失败。这里隔一分钟后重新连接
+	if (! s->dev->is_clone) {
+		s->idle_time = CLONE_UC_IDLE_TIME;
+		ucdc_set_status(s, UCCS_IDLE);
+	}
+
+}
+
+static void ICACHE_FLASH_ATTR ucdc_error_out(ucdc_session_t *s)
+{
+	// do nothing
+}
+
+static void ICACHE_FLASH_ATTR ucdc_error_proc(ucdc_session_t *s)
+{
+	ucph_t *hdr;
+	hdr = (ucph_t *)s->rcv_buf;
+	hdr = hdr;			//解决编译警告
+	// do nothing
+	CLIENT_ERROR("%s at %s ignore reply pkt cmd=%u\n", s->name, ucdc_proc[s->status].name, hdr->command);
+}
+
+
+ucc_proc_t ucdc_proc[UCCS_MAX] = {
+	{"IDLE", ucdc_idle_into, ucdc_idle_out, ucdc_idle_proc},
+	{"AUTH_REQ", ucdc_auth_req_into, ucdc_auth_req_out, ucdc_auth_req_proc},
+	{"AUTH_ANSWER", ucdc_auth_answer_into, ucdc_auth_answer_out, ucdc_auth_answer_proc},
+	{"ESTAB", ucdc_estab_into, ucdc_estab_out, ucdc_estab_proc},
+	{"CLIENT_ERROR", ucdc_error_into, ucdc_error_out, ucdc_error_proc},
+};
+
+
+void ICACHE_FLASH_ATTR
+ucdc_set_status(ucdc_session_t *s, int status)
+{
+	int prev_satus = s->status;
+	if (status >= UCCS_MAX) {
+		CLIENT_ERROR("ucdc_set_status unknow new status = %d\n", status);
+		return;
+	}
+	s->status = status;
+
+	CLIENT_INFO("%s modify status from %s to %s\n",
+	            s->name, ucdc_proc[prev_satus].name, ucdc_proc[status].name);
+
+	ucdc_proc[prev_satus].on_out(s);
+	ucdc_proc[status].on_into(s);
+}
+
+
+static int ICACHE_FLASH_ATTR ucdc_read(ucdc_session_t *s)
+{
+	int n, total, pad_len;
+	ucph_t *hdr;
+
+	if(!s) {
+		return -1;
+	}
+
+
+	hdr = (ucph_t *)s->rcv_buf;
+	n = total = s->rcv_len;
+
+	CLIENT_DEBUG("recv from server: len=%d, is_req=%d, rid=%u, csid=%08x, dsid=%08x\n",
+	             n, hdr->request, hdr->request_id, ntohl(hdr->client_sid), ntohl(hdr->device_sid));
+
+
+	// 该通道同时跑了设备与服务器的数据，以及客户端通过服务器代理过来的数据
+	if (hdr->client_sid != 0) {
+		if (s->status != UCCS_ESTABLISH) {
+			CLIENT_ERROR("%s drop agent pkt from server: my status=%u now.\n",
+			             s->name, s->status);
+			return 0;
+		}
+		ucds_proc_pkt(piw_priv->devconn, s->rcv_buf, n);
+		return 0;
+	}
+
+
+	// 1. 解密、检查长度合法性
+	if (hdr->encrypt) {
+		if (((n - ucph_hdr_plain_size) % AES128_EKY_LEN) != 0) {
+			CLIENT_ERROR("Drop bad packet: n=%d, but encrypt=1\n", n);
+			return 0;
+		}
+		dec_block((u_int8_t *)BOFP(hdr, ucph_hdr_plain_size), (n - ucph_hdr_plain_size), s->key);
+		pad_len = ((u_int8_t *)hdr)[n - 1];
+		if (pad_len > AES128_EKY_LEN || pad_len <= 0) {
+			CLIENT_ERROR("Drop bad packet: encrypt pad=%d\n", pad_len);
+			return 0;
+		}
+		total -= pad_len;
+	}
+
+	uc_hdr_order(hdr);
+	if (ucph_hdr_len(hdr) < ucph_hdr_size
+	    || total != hdr->param_len + ucph_hdr_len(hdr)) {
+		CLIENT_ERROR("Drop bad packet: total=%d, ucph_hdr_len=%d, param_len=%d\n",
+		             total, ucph_hdr_len(hdr), hdr->param_len);
+		return 0;
+	}
+
+	// 2. 检查会话ID
+	if (s->device_sid != UC_SID_INVALID && s->device_sid != hdr->device_sid) {
+		CLIENT_ERROR("Drop bad packet: packet session id=%u, but now is %u\n",
+		             hdr->device_sid, s->device_sid);
+		return 0;
+	}
+
+	// update ip address and port
+	//s->ip = ntohl(addr.sin_addr.s_addr);
+	//s->port = ntohs(addr.sin_port);
+
+	//默认打开报文收发打印
+	CLIENT_DEBUG("<<<< ----- ucdc_read  %s recv from %u.%u.%u.%u:%u: cmd=%u, action=%u, plen=%u, csid=%08x, dsid=%08x, rid=%u(is %s)\n",
+	             s->name, IP_SHOW(s->ip), s->port, hdr->command, *((u_int8_t *)(hdr + 1)), hdr->param_len,
+	             hdr->client_sid, hdr->device_sid, hdr->request_id, hdr->request ? "request" : "reply");
+
+	// 处理报文
+	ucdc_proc[s->status].proc_pkt(s);
+
+	return 0;
+}
+#endif
+
+
+void ICACHE_FLASH_ATTR ucdc_lpc_send(ucdc_session_t *s)
+{
+	int n;
+	pkt_t *pkt = s->last_pkt;
+
+	if (!pkt) {
+		return;
+	}
+
+	n = iw_udp_send(s->ip, s->port, (char *)pkt->data, pkt->total, s->conn);
+	if (n <= 0) {
+		CLIENT_ERROR("ucdc_lpc_send %s send pkt failed: ip=%u.%u.%u.%u, port=%d, want=%d, send=%d\n",
+		             s->name, IP_SHOW(s->ip), s->port, pkt->total, n);
+	} else {
+		//默认打开报文收发打印
+#if 0
+		ucph_t *hdr;
+		hdr = (ucph_t *)pkt->data;
+		CLIENT_DEBUG("ucdc_lpc_send %s send ip=%u.%u.%u.%u, port=%d, len=%d: cmd=%u, action=%u, req=%d, enc=%d, csid=%08x, dsid=%08x, rid=%u, my_request_id=%u\n",
+		             s->name, IP_SHOW(s->ip), s->port, n,
+		             pkt->cmd, *((u_int8_t *)(hdr + 1)), hdr->request, hdr->encrypt,
+		             ntohl(hdr->client_sid), ntohl(hdr->device_sid), hdr->request_id, s->my_request_id);
+#endif
+	}
+}
+
+void ICACHE_FLASH_ATTR ucdc_lpc_clean(ucdc_session_t *s)
+{
+	if (s->last_pkt) {
+		pkt_free(s->last_pkt);
+		s->last_pkt = NULL;
+	}
+}
+
+void reset_server_session(void)
+{
+	ucdc_set_status(&ucd.client, UCCS_IDLE);
+}
+
+void ICACHE_FLASH_ATTR ucdc_lpc_set(ucdc_session_t *s, pkt_t *pkt)
+{
+	if (s->last_pkt) {
+		ucdc_lpc_clean(s);
+	}
+
+	s->last_pkt = pkt;
+}
+
+bool ICACHE_FLASH_ATTR ucdc_lpc_is_need_send(ucdc_session_t *s)
+{
+	return (s->last_pkt != NULL && s->last_pkt_enable);
+}
+
+void ICACHE_FLASH_ATTR ucdc_lpc_enable(ucdc_session_t *s, bool enable)
+{
+	s->last_pkt_enable = enable;
+}
+
+
+// 应答报文不需要重传，这里要注意一下，因为加了最后包缓存，用该函数发送数据后不用释放包
+int ICACHE_FLASH_ATTR ucdc_send_pkt(ucdc_session_t *s, pkt_t *pkt)
+{
+	int n;
+
+	if(s == NULL || pkt == NULL){
+		CLIENT_ERROR("ucdc_send_pkt ERROR\n");
+		return RS_ERROR;
+	}
+	
+	//释放上次包缓存，覆盖新包。
+	ucdc_lpc_clean(s);
+	ucdc_lpc_set(s, pkt);
+
+	n = iw_udp_send(s->ip, s->port, (char *)pkt->data, pkt->total, s->conn);
+	if (n <= 0) {
+		CLIENT_ERROR("%s send pkt failed: ip=%u.%u.%u.%u, port=%d, want=%d, send=%d\n",
+		             s->name, IP_SHOW(s->ip), s->port, pkt->total, n);
+	} else {
+#ifdef CLIENT_DEBUG_
+		ucph_t *hdr;
+		hdr = (ucph_t *)pkt->data;
+		CLIENT_DEBUG("--- !!! >>>>> ucdc_send_pkt %s send ip=%u.%u.%u.%u, port=%d, len=%d: cmd=%u, action=%u, req=%d, enc=%d, csid=%08x, dsid=%08x, rid=%u, my_request_id=%u\n",
+		             s->name, IP_SHOW(s->ip), s->port, n,
+		             pkt->cmd, *((u_int8_t *)(hdr + 1)), hdr->request, hdr->encrypt,
+		             ntohl(hdr->client_sid), ntohl(hdr->device_sid), hdr->request_id, s->my_request_id);
+#endif
+	}
+
+	return 0;
+}
+
+
+LOCAL void ICACHE_FLASH_ATTR
+iw_dev_recv(void *arg, char *pusrdata, unsigned short length)
+{
+	//ucph_t *hdr;
+	ucdc_session_t *s;
+	struct espconn *conn;
+	remot_info *premot = NULL;
+	sint8 ret = ESPCONN_OK;
+
+	if(length < (u_int16_t)ucph_hdr_size || pusrdata == NULL || !arg) {
+		CLIENT_ERROR("iw_dev_recv err lenth:%d pusrdata:%p\r\n", length, pusrdata);
+		return;
+	}
+
+	conn = (struct espconn *)arg;
+	s = (ucdc_session_t *)conn->reverse;
+	os_memcpy(ucd_rcv_buf, pusrdata, length);
+	s->rcv_len = length;
+
+	if ((ret = espconn_get_connection_info(conn, &premot, 0)) == ESPCONN_OK) {
+		conn->proto.udp->remote_port = premot->remote_port;
+		conn->proto.udp->remote_ip[0] = premot->remote_ip[0];
+		conn->proto.udp->remote_ip[1] = premot->remote_ip[1];
+		conn->proto.udp->remote_ip[2] = premot->remote_ip[2];
+		conn->proto.udp->remote_ip[3] = premot->remote_ip[3];
+		CLIENT_DEBUG("%s recv from ip %u.%u.%u.%u port:%d\n", __FUNCTION__,
+		             conn->proto.udp->remote_ip[0],
+		             conn->proto.udp->remote_ip[1],
+		             conn->proto.udp->remote_ip[2],
+		             conn->proto.udp->remote_ip[3],
+		             conn->proto.udp->remote_port);
+
+		ucdc_read(s);
+	} else {
+		CLIENT_ERROR("iw_dev_recv get premot ip and port failed ret(%d)\n", ret);
+	}
+
+}
+
+
+rs_t ICACHE_FLASH_ATTR iw_init_dev_udp(iw_priv_t *piw)
+{
+#define UDP_PORT_BASE	30000
+#define UPD_PORT_END	60000
+#define MAX_TRY_COUNT	100
+	struct espconn *conn;
+	int i = 0;
+	static u_int16_t port = 0;
+	ucdc_session_t *s = NULL;
+
+
+	conn = piw->devconn;
+	if (conn != NULL) {
+		os_free(conn->proto.udp);
+		espconn_delete(conn);
+		os_free(conn);
+	}
+
+	if (port == 0) {
+		port = (g_dev.sn % 10000) + UDP_PORT_BASE;
+	}
+
+	for (i = 0; i < MAX_TRY_COUNT; i++, port++) {
+
+		if (port >= UPD_PORT_END) {
+			port = (g_dev.sn % 10000) + UDP_PORT_BASE;
+		}
+
+		conn = iw_udp_server_create(0, port, iw_dev_recv, iw_dev_sendback);
+		if(conn != NULL) {
+			break;
+		} else {
+			CLIENT_ERROR("creat port %u failed when iw_init_dev_udp\n", port);
+		}
+	}
+
+	if (conn == NULL) {
+		CLIENT_ERROR("init_dev_udp clinet failed\n");
+		return RS_ERROR;
+	}
+
+	conn->reverse = (void *)&ucd.client;
+	s = &ucd.client;
+	if (s) {
+		s->conn = conn;
+	} else {
+		CLIENT_ERROR("ucdc_session_t s is NULL\n");
+	}
+	piw->devconn = (void*)conn;
+	port++;
+	return RS_OK;
+}
+
+int ICACHE_FLASH_ATTR iw_ucd_license(void)
+{
+	ucd.sn = g_dev.sn;
+	ucd.dev_type = g_dev.dev_type;
+	ucd.ext_type = g_dev.ext_type;
+	os_memcpy(ucd.mac, g_dev.mac, LCC_MAC_LEN);
+	os_strcpy(ucd.passwd, (char*)g_dev.df_pwd);
+	hash_passwd(ucd.passwd_md5, ucd.passwd);
+	os_memcpy(ucd.vendor, g_dev.vendor, LCC_VENDOR_LEN);
+	os_memcpy(ucd.preshare_key, g_dev.preshare_key, LCC_PRESHARE_KEY_LEN);
+	return RS_OK;
+}
+
+
+rs_t ICACHE_FLASH_ATTR ucdc_init(ucd_t *dev)
+{
+	ucdc_session_t *s;
+
+	s = &dev->client;
+
+	// 回话来自服务器
+	s->ucd_session_type = UCD_ST_SERVER;
+
+	if(g_uuid.valid) {
+		os_memcpy(s->uuid, g_uuid.uuid, MAX_UUID_BIN_LEN);
+	}
+	os_sprintf(s->name, "'UCDC'");
+	s->status = UCCS_IDLE;
+	s->idle_time = 0;
+	s->rcv_buf = (u_int8_t *)ucd_rcv_buf;
+	s->conn = piw_priv->devconn;
+
+	// init default time parament
+	uc_set_default_time_param(&s->time_param, &s->time_param_net);
+	s->time_param_cur = &s->time_param.dev;
+	s->dev = dev;
+
+	STLC_INIT_LIST_HEAD(&s->send_list);
+	ucdc_set_status(s, UCCS_IDLE);
+
+	return RS_OK;
+}
+
+rs_t ICACHE_FLASH_ATTR iw_dev_init(iw_priv_t *piw)
+{
+	if(NULL == piw){
+		CLIENT_ERROR("iw_dev_init ERROR\n");	
+		return RS_ERROR;
+	}
+	
+	iw_init_dev_udp(piw);
+	ucdc_init(&ucd);
+
+#ifdef HAS_PKT_CLONE
+	/* 是否上报克隆报文 */
+	ucd.is_clone_pkt_enable = false;
+#endif
+
+	return RS_OK;
+}
+

@@ -1,0 +1,536 @@
+/**************************************************************************
+**  Copyright (c) 2010 GalaxyWind, Ltd.
+**
+**  Project: iw_uart_ijuartpro.c
+**  File:    iw_uart_ijuartpro.c
+**  Author:  
+**  Date:    06/09/2015
+**
+**  Purpose:
+**    I+ uart proto prase.
+**************************************************************************/
+
+
+/* Include files. */
+#include "iw_priv.h"
+#include "iw_uart_ijuartpro.h"
+#include "iw_uc_tt_common.h"
+#include "iw_lan_srv.h"
+#include "ysd_version.h"
+
+
+/* Macro constant definitions. */
+#define MAX_UART_BD_NUM	 3
+#define UART_DATA_LEN    256
+#define HAS_TIMER_SEND
+#define PARSE_TIME 300
+#define QUERY_TIME 1000
+#define CHECK_TIME 200
+#define SEND_TIMER_TIME 500
+#define UART_RESET 0x04
+#define VER_QUREY_TIME 5
+
+//串口查询命令
+#define QUERE_STATE             (0x01)
+#define SET_STATE               (0x02)
+#define PUSH_STATE              (0x03)
+#define UART_CMD_VER     		(0x51)						/* 获取单片机版本 */
+
+/* Type definitions. */
+enum {
+	BUF_IDLE,
+	BUF_PRO,
+	BUF_OK,
+};
+
+typedef struct {
+	u_int8_t has_data;
+	u_int8_t data_len;
+	u_int8_t data[UART_DATA_LEN];
+} uart_db_t;
+//串口信息
+typedef struct uart_s{
+	u8 state;
+	u_int16_t index_read;
+	u64 last_input_time;		// 最后一次串口输入的时间
+	u16 need_data_len;
+	bool init_done;
+	uart_db_t *cur_uart_db;
+	uart_db_t uart_db[MAX_UART_BD_NUM];
+    u_int8_t bd_parse_begin; 
+
+	u_int8_t req_id;
+
+	struct stlc_list_head send_list;	
+}uart_t;
+
+typedef struct{
+	struct stlc_list_head link;
+	u_int8_t len;
+}base_uart_pkt_t;
+
+typedef struct {
+	u_int8_t pre_data1; 
+	u_int8_t pre_data2;
+	u_int8_t rid;
+	u_int8_t cmd;
+	u_int16_t param_len;
+	u_int8_t ret;
+	u_int8_t checksum;
+} uart_hdr_t;
+
+
+/* Local function declarations. */
+
+
+/* Macro API definitions. */
+#define	VOF(_a, _i) ((u_int8_t *)(_a))[_i]
+
+#if 1
+#define BASE_DEBUG(fmt...)  DEBUG(fmt)
+#define BASE_INFO(fmt...)   INFO(fmt)
+#define BASE_ERROR(fmt...)  ERROR(fmt)
+#else
+#define BASE_INFO(fmt...)   
+#define BASE_DEBUG(fmt...) 
+#define BASE_ERROR(fmt...)  DBGPRINT_MGMT(DEBUG_ERROR, fmt)
+#endif
+
+#if 1
+#define BASE_DEBUG_UART(fmt...)  DEBUG(fmt)
+#define BASE_INFO_UART(fmt...)   INFO(fmt)
+#define BASE_ERROR_UART(fmt...)  ERROR(fmt)
+#else
+#define BASE_INFO(fmt...)   
+#define BASE_DEBUG(fmt...) 
+#define BASE_ERROR(fmt...)  DBGPRINT_MGMT(DEBUG_ERROR, fmt)
+#endif
+
+
+/* Global variable declarations. */
+static uart_t uart;
+
+
+extern void dump_mem(char *msg, u_int8_t *data, int data_len);
+
+/*串口数据发送处理*/
+static int base_uart_send_data(u_int8_t *data, u_int16_t len)
+{
+	int i = 0;
+
+	for(i = 0; i < len; i++){
+		uart_tx_one_char(UART0, (uint8)data[i]);
+	}
+
+	return 0;
+}
+
+//data包含串口头部 
+static u_int8_t ICACHE_FLASH_ATTR uart_checksum(u_int8_t *data, u_int16_t data_len)
+{
+	uart_hdr_t *hd = NULL;
+	u_int8_t checksum1 = 0, checksum2 = 0;
+	u_int16_t i = 0;
+
+	if (!data) {
+		BASE_INFO_UART("func:%s data is null",__FUNCTION__);
+		return 0;
+	}
+
+	if (data_len < sizeof(uart_hdr_t) - 1) {
+		BASE_INFO_UART("func:%s data_len is wrong(%u)\n",__FUNCTION__, data_len);
+		return 0;
+	}
+	
+	hd = (uart_hdr_t *)data;
+	//buf = data;
+	//len = ntohs(hd->param_len);
+
+	for (i = 0; i < sizeof(*hd) - 1; i++) {
+		checksum1 ^= data[i];
+	}
+	checksum1 = (checksum1 ^ ((checksum1) << 4)) & 0xF0;
+		
+	for (i = sizeof(*hd); i < data_len; i++) {
+		checksum2 ^= data[i];
+	}
+
+	checksum2 = (checksum2 ^ (checksum2 >> 4)) & 0x0F;
+
+	return (checksum1 | checksum2);
+}
+
+
+int ICACHE_FLASH_ATTR base_uart_send_timer(void *arg)
+{
+	base_uart_pkt_t *pkt = NULL;
+	
+	if (stlc_list_empty(&uart.send_list)) {
+		return 0;
+	}
+	
+	pkt = (base_uart_pkt_t *)stlc_list_entry(uart.send_list.next, base_uart_pkt_t, link);
+
+	base_uart_send_data((u_int8_t *)&pkt[1], pkt->len);
+	//base_uart_send_data(pkt->data, pkt->len);
+
+	stlc_list_del(&pkt->link);
+
+	iw_free(pkt);
+
+	return 0;
+}
+
+
+static int base_uart_add_request(u_int8_t *data, u_int16_t len)
+{
+	base_uart_pkt_t *pkt = NULL;
+	u_int8_t real_len;	
+	u_int8_t count = 0;
+
+	if (!data || len == 0) {
+		BASE_ERROR("base_uart_add_request data is null\r\n");
+		return -1;
+	}
+
+	stlc_list_count(count, &uart.send_list);
+	
+	BASE_INFO("len = %u, pkt_len=%u, count = %u\r\n", len, sizeof(base_uart_pkt_t), count);
+
+	if(count > 10){
+		BASE_ERROR("list count > 10\r\n");
+		return 1;
+	}
+
+	real_len = sizeof(base_uart_pkt_t) + len;
+	pkt = (base_uart_pkt_t *)iw_calloc(real_len, 1);
+	if (!pkt) {
+		BASE_ERROR("base cl_calloc fail\n");
+		return -1;
+	}
+
+	os_memcpy((u_int8_t *)&pkt[1], data, len);
+	pkt->len = len;
+
+	stlc_list_add_tail(&pkt->link, &uart.send_list);
+	return 0;
+}
+
+
+
+//通过串口发送数据
+void base_uart_send(u_int8_t *data, u_int16_t len)
+{
+	uart_hdr_t *temp = NULL;
+
+	if(len < sizeof(uart_hdr_t) || data == NULL){
+		return ;
+	}
+
+	temp = (uart_hdr_t *)data;
+	temp->rid = uart.req_id++;
+	temp->rid &= 0x7F;
+
+	temp->checksum = uart_checksum(data, len);
+
+	dump_mem("net_to_uart_parse_date", data, len);
+	
+#ifdef HAS_TIMER_SEND
+	base_uart_add_request(data, len);
+#else 
+	base_uart_send_data(data, len);
+#endif
+}
+
+
+#define CHECKSUM_ADD
+void ICACHE_FLASH_ATTR uart_input(void *data)
+{
+	u_int8_t checksum;
+	uart_hdr_t *hdr;
+	u16 *len;
+	int i =0 ;
+	u_int8_t value = *(u_int8_t *)data;
+	u_int8_t p_len[2];
+
+	// 长时间无数据输入，而之前有收到部分报文，做丢弃处理
+	if (get_up_msec() - uart.last_input_time > 300) {
+		if (uart.state != US_NONE) {
+			BASE_INFO_UART("drop prev uart:stat=%u, idx_read=%u\n", uart.state, 
+				uart.index_read);
+			uart.index_read = 0;
+			uart.state = US_NONE;
+		}
+	}
+	if (uart.cur_uart_db->has_data) {
+		BASE_INFO_UART("uart bd full ... \n");
+		goto err;
+	}
+	
+	BASE_INFO_UART("value1 = 0x%02x\r\n", value);			
+	uart.last_input_time = get_up_msec();
+	
+	hdr = (uart_hdr_t *)uart.cur_uart_db->data;
+	switch (uart.state) {
+		case US_NONE:
+			if (UART_SYNC1 == value){
+				uart.state = US_SYNC2;
+				uart.cur_uart_db->data[uart.index_read++] = value;
+			}
+			break;
+		case US_SYNC2:
+			if (UART_SYNC2 == value){
+				uart.state = US_HEAD;
+				uart.cur_uart_db->data[uart.index_read++] = value;
+			}
+			break;	
+		case US_HEAD:
+			uart.cur_uart_db->data[uart.index_read++] = value;
+			if (uart.index_read >= UART_HEAD_LEN){
+				//小端处理
+				p_len[0] = uart.cur_uart_db->data[5];
+				p_len[1] = uart.cur_uart_db->data[4];
+				len = (u16 *)p_len;
+				uart.need_data_len = *len + UART_CHECKSUM_LEN;
+				uart.state = US_DATA;
+			}		
+			break;	
+		case US_DATA:
+			// 数据过多，溢出
+			if (uart.index_read >= UART_DATA_LEN) {
+				goto err;
+			}
+			uart.cur_uart_db->data[uart.index_read++] = value;
+
+			if (uart.index_read >= UART_HEAD_LEN + uart.need_data_len){
+				uart.cur_uart_db->data_len = uart.index_read;
+				goto done;
+			}
+			break;
+	}
+	return;
+done:
+	checksum = uart_checksum(uart.cur_uart_db->data, uart.cur_uart_db->data_len);
+#ifdef CHECKSUM_ADD
+	BASE_INFO_UART("uart recv done\r\n");
+	if (hdr->checksum != checksum) {
+		BASE_INFO_UART("checksum is err,recive checksum:%x cal:%x datalen:%u readlen:%u\n",
+		hdr->checksum, checksum,uart.cur_uart_db->data_len, uart.index_read);
+		for(i = 0 ; i < uart.cur_uart_db->data_len; i++) {
+			BASE_INFO_UART("%x:",uart.cur_uart_db->data[i]);
+		}		
+		goto err;
+	}else{
+#endif
+		uart.cur_uart_db->has_data = true;
+		value = uart.cur_uart_db - &uart.uart_db[0];	
+		uart.cur_uart_db = &uart.uart_db[(value + 1) % MAX_UART_BD_NUM];
+#ifdef CHECKSUM_ADD
+	}
+#endif	
+err:
+	uart.index_read  = 0;
+	uart.state = US_NONE;
+}
+
+
+static rs_t ICACHE_FLASH_ATTR iw_uart_2ijuartproto(iw_event_info_t *INOUT_info)
+{
+	uart_input(INOUT_info->cu.cp);
+	
+	return RS_OK;
+}
+
+static void ICACHE_FLASH_ATTR udp_uart_tt_send(ucds_session_t *s, int len, u_int8_t *buf)
+{
+	u_int8_t *uobj_param;
+	pkt_t *pkt;
+	u_int32_t obj_arr[5] = {0};
+	ucp_ctrl_t *uc_reply;
+
+	uci_proc_num = 0;
+	uci_send_index =0;
+
+	len = len > 1496 ? 1496 : len;
+
+	obj_arr[0] = UCA_PUSH;
+	obj_arr[1] = UCOT_IA;
+	obj_arr[2] = UCSOT_IA_TT;
+	obj_arr[3] = UCAT_IA_TT_ALLSTATE;
+	obj_arr[4] = 4 + len;
+	
+	BASE_INFO_UART("len=%d\n", obj_arr[4]);
+	if ((uobj_param = os_malloc(obj_arr[4])) == NULL) {
+		BASE_ERROR("calloc len %u failed\n", obj_arr[4]);
+		return;
+	}
+	*(u_int16_t *)&uobj_param[0] = htons(UCT_VENDOR);
+	*(u_int16_t *)&uobj_param[2] = htons(len);
+
+	os_memcpy(uobj_param+4, buf, len);
+
+	uc_put_elemet(uci_send_buf, MAX_UC_PKT_SIZE, &uci_send_index, obj_arr[1], obj_arr[2], obj_arr[3], obj_arr[4], uobj_param);
+	os_free(uobj_param);
+
+	pkt = uc_pkt_new(CMD_UDP_CTRL, uci_send_index + sizeof(ucp_ctrl_t),
+				true, s->is_enc, 0, s->client_sid, ucd.client.device_sid, s->my_request_id);
+	if (pkt == NULL) {
+		BASE_ERROR_UART("no buffer for packets.\n");
+		return;
+	}
+
+	uc_reply = get_ucp_payload(pkt, ucp_ctrl_t);
+	uc_reply->action = UCA_PUSH;
+	uc_reply->count = uci_proc_num;
+	BASE_INFO_UART("uci_proc_num=%d\n", uci_proc_num);
+	os_memcpy((u_int8_t *)(uc_reply + 1), uci_send_buf, uci_send_index);
+	
+	ucds_request_add(s, pkt);
+	
+}
+
+void ICACHE_FLASH_ATTR _save_data(int len, u_int8_t *data)
+{	
+	conf_dev_set(DEV_SERVER_YSD_STATE, data, len);
+}
+
+static void uart_stm_query(void *data, int data_len)
+{
+	sys_t *sys = &sys_mu_config.sys;
+	u_int8_t *pdata = (u_int8_t *)data;
+
+	if (data_len >= sizeof(u_int32_t)) {
+		sys->smt_hard_ver = VERTION(pdata[0], pdata[1], pdata[2])|(pdata[3]&0xff);	
+		data_len = data_len -  (int)sizeof(u_int32_t);
+		BASE_INFO_UART("smt hard version=%u.%u.%u.%u\n", pdata[0], pdata[1], pdata[2], pdata[3]);		
+	
+		pdata += sizeof(u_int32_t);
+	}
+
+	if (data_len >= sizeof(u_int32_t)) {
+		sys->smt_soft_ver = VERTION(pdata[0], pdata[1], pdata[2])|(pdata[3]&0xff);
+		data_len = data_len -  (int)sizeof(u_int32_t);
+		BASE_INFO_UART("smt soft version=%u.%u.%u.%u\n", pdata[0], pdata[1], pdata[2], pdata[3]);		
+		pdata += sizeof(u_int32_t);		
+	}		
+}
+
+void ICACHE_FLASH_ATTR uart_parse(uart_db_t *bd)
+{
+	ucds_session_t *s = NULL;
+	u_int32_t i;
+	uart_hdr_t *hdr = (uart_hdr_t *)bd->data;	
+
+	switch(hdr->cmd){
+		case UART_RESET:
+			BASE_INFO_UART("uart cmd reset now\n");
+			iw_sys_reset();			
+			break;
+		case PUSH_STATE:
+			BASE_INFO_UART("uart data --->> net, data_len = %u\n", bd->data_len);		
+			_save_data(bd->data_len, bd->data);
+			for (i = 0; i < MAX_UCDS_SESSION; i++) {
+				s = &ucd.sessions[i];
+				if (s->is_used)	{
+					udp_uart_tt_send(s, bd->data_len, bd->data);
+				}
+			}			
+			break;
+		case UART_CMD_VER:
+			uart_stm_query(hdr+1, hdr->param_len);
+			break;
+		default:
+			BASE_INFO_UART("no uart cmd\n");
+			break;
+			
+	}
+}
+
+void ICACHE_FLASH_ATTR evm_dump_mem1(char *msg, u_int8_t *data, int data_len)
+{
+	char buf[256] = {0};
+	int i, len;
+
+	if (data_len > 100) {
+		return;
+	}
+
+
+	for (i = len = 0; i < data_len; i++) {
+		len += os_sprintf(&buf[len], "%02X ", data[i]);
+	}
+	
+	BASE_INFO_UART("%s: len %u \n %s\n", msg, data_len, buf);
+}
+
+int ICACHE_FLASH_ATTR parse_data(void *arg)
+{
+	int i;
+	uart_db_t *bd;
+
+	for (i = 0; i < MAX_UART_BD_NUM; i++) {
+		bd = &uart.uart_db[uart.bd_parse_begin];
+		if (!bd->has_data){
+			break;
+		}
+		
+		evm_dump_mem1("parse_data", bd->data, bd->data_len);
+		uart_parse(bd);		
+
+		bd->has_data = false;
+		uart.bd_parse_begin = (uart.bd_parse_begin + 1) % MAX_UART_BD_NUM;
+	}
+	
+	return 0;
+}
+
+
+int ICACHE_FLASH_ATTR look_data(void *arg)
+{
+	u_int8_t buf[8] = {0xff, 0xaa, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00};
+	
+	buf[2] = uart.req_id++;
+	buf[7] = uart_checksum(buf, sizeof(buf) - 1);
+
+	base_uart_send(buf, sizeof(buf));
+
+	return 0;
+}
+
+int ICACHE_FLASH_ATTR ver_qurey(void *arg)
+{
+	u_int8_t buf[8] = {0xff, 0xaa, 0x00, UART_CMD_VER, 0x00, 0x00, 0x00, 0x00};
+	
+	buf[2] = uart.req_id++;
+	buf[7] = uart_checksum(buf, sizeof(buf) - 1);
+
+	base_uart_send(buf, sizeof(buf));
+
+	return 0;
+}
+
+void ICACHE_FLASH_ATTR iw_uart_ijuartproto_init(void)
+{
+	os_memset(&uart, 0, sizeof(uart));
+
+	uart.cur_uart_db = &uart.uart_db[0];
+
+	STLC_INIT_LIST_HEAD(&uart.send_list);
+
+	//串口命令检查定时器
+	iw_timer_set(TID_UART_CMD_PARAM, TIME_N_MSECOND(PARSE_TIME), 1, parse_data, NULL);
+	//下位机数据查询命令定时发送
+	iw_timer_set(TID_UART_DATE_LOOK_UP, TIME_N_MSECOND(QUERY_TIME), 1, look_data, NULL);
+	//版本信息查询定时器
+	iw_timer_set(TID_UER_QUE, TIME_N_SECOND(VER_QUREY_TIME), 1, ver_qurey, NULL);
+	//串口数据发送定时器
+	iw_timer_set(TID_UART_SEND, TIME_N_MSECOND(SEND_TIMER_TIME), 1, base_uart_send_timer, NULL);
+
+	//串口接收数据事件
+	iw_event_register(IW_EV_UARTR_2IJPROTO, iw_uart_2ijuartproto);
+
+	BASE_INFO_UART("iw_uart_ijuartproto_init OK!!\r\n");
+	uart.init_done = 1;	
+}
+
+

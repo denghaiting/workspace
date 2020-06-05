@@ -1,0 +1,731 @@
+/**************************************************************************
+**  Copyright (c) 2011 GalaxyWind, Ltd.
+**
+**  Project: FOTA
+**  File:    upgrade.c
+**  Author:  xushengjian
+**  Date:    07/20/2015
+**
+**  Purpose:
+**    Firmware upgrade over-the-air.
+**************************************************************************/
+
+/* Include files. */
+#include "c_types.h"
+#include "types_def.h"
+#include "iw_8266.h"
+#include "iw_platform.h"
+#include "iw_api.h"
+#include "udp_ctrl.h"
+#include "md5.h"
+#include "iw_uptime.h"
+#include "iw_thread_timer.h"
+#include "ds_proto.h"
+#include "iw_debug.h"
+#include "iw_net.h"
+#include "iw_flash.h"
+#include "iw_sys_time.h"
+
+/* Macro constant definitions. */
+
+#define UPGRADE_DEBUG_
+#ifdef UPGRADE_DEBUG_
+#define UPGRADE_INFO(x...)  INFO(x)
+#define UPGRADE_DEBUG(x...) DEBUG(x)
+#define UPGRADE_ERROR(x...)  ERROR(x)
+#else
+#define UPGRADE_DEBUG(x...)
+#define UPGRADE_INFO(x...)
+#define UPGRADE_ERROR(x...) ERROR(x)
+#endif
+
+#define MD5_SIZE		16
+
+//升级定时器
+#define SYS_UPGRADE_TIMER_DIE		5*60
+//第一块升级分片
+#define SYS_UPGRADE_FIRST_BLOCK		1
+
+//user1.bin user2.bin的起始地址
+#define UPGRADE_USER1_ADDR (0x1000)//4k
+#define UPGRADE_USER2_ADDR (0x81000)//512+4K----start addr
+
+//user.bin的分布界限
+#define FW_IMG_SIZE_MAX (0x7B000) //492K---max size
+#define FW_USER1_UP (UPGRADE_USER1_ADDR + FW_IMG_SIZE_MAX)
+//#define UPGRADE_FW_BIN1 (0x00)
+//#define UPGRADE_FW_BIN2 (0x01)
+
+#define UPGRADE_FLAG_IDLE 0x00
+#define UPGRADE_FLAG_START 0x01
+#define UPGRADE_FLAG_FINISH 0x02
+
+#define FW_MAX_SIZE FW_IMG_SIZE_MAX
+// TODO:最小值不定
+#define FW_MIN_SIZE (32)
+
+#define UPGRADE_HEADER_SIZE		sizeof(upgrade_header_t)
+
+#define BIN_MAGIC_FLASH  (0xE9)
+#define BIN_MAGIC_IROM   (0xEA)
+
+#define CHECKSUM_INIT (0xEF)
+#define SEG_HEAD_MAX (16)
+
+enum {
+	BLOCK1_HEAD_1 = 0,
+	BLOCK1_HEAD_2 = 1,
+	BLOCK1_HEAD_3 = 2,
+	BLOCK1_HEAD_4 = 3,
+
+	BLOCK1_DATA = 4,
+
+	BLOCK2_HEAD_1 = 5,
+	BLOCK2_HEAD_2 = 6,
+	BLOCK2_HEAD_3 = 7,
+	BLOCK2_HEAD_4 = 8,
+
+	BLOCK2_DATA = 9,
+
+	BLOCK3_HEAD_1 = 10,
+	BLOCK3_HEAD_2 = 11,
+
+	BLOCK3_DATA = 12,
+
+	BLOCK4_HEAD_1 = 13,
+	BLOCK4_HEAD_2 = 14,
+
+	BLOCK4_DATA = 15,
+
+	TAIL_CRC = 16,
+};
+
+enum {
+	CRC_WAIT = 0,
+	CRC_OK = 1,
+	CRC_FAILED = 2,
+};
+
+#define IROM_TEXT_MAX_SIZE (0x6B000)
+#define FLASH_TEXT_MAX_SIZE (0x10000)
+/* Type definitions. */
+#pragma pack(push,1)
+/*
+当total-block 大于 current-block时，data为升级包内容。
+当total-block 等于 current-block时，表示传输结束，data为升级包的md5校验和。
+*/
+typedef struct upgrade_header_s {
+	u_int16_t total_block;
+	u_int16_t current_block;
+	//u_int8_t data[0]
+} upgrade_header_t;
+
+#pragma pack(pop)
+
+typedef struct upgrade_ctrl_s {
+	//锁定的客户端
+	void *s;
+	//upgrade_type语义修改为，以user1为有效镜像还是user2
+	int upgrade_type;
+	//写flash的开始地址
+	u_int32_t flash_addr;
+	u_int32_t addr;
+	u_int32_t upgrade_addr;
+	//镜像大小判断累加
+	u_int32_t image_size_check;
+	//记录上次写成功分区，避免重写
+	int upgrade_last_block;
+	//md5计算
+	u_int8_t md5_cal[MD5_SIZE];
+	MD5_CTX ctx;
+	//此次升级的起始地址，由user1 or 2决定
+	u_int32_t upgrade_user_bin_start;
+	os_timer_t crc_timer;
+	bool upgrade_finish;
+	u_int8_t crc_stat;
+	u_int32_t seg_pos;
+	u_int8_t chk_sum;
+	u_int8_t chk_sum_new;
+	u_int32_t seg_size;
+	u_int8_t seg_type;
+	u_int32_t count;
+	//记录跳过的镜像长度
+	u_int32_t sum_len;
+} upgrade_ctrl_t;
+
+/* External function declarations. */
+extern void uc_do_set_reply(ucp_obj_t *uobj, u_int16_t err);
+/* Macro API definitions. */
+
+
+/* Global variable declarations. */
+//extern void ICACHE_FLASH_ATTR lede_restart_init(void) ;
+
+upgrade_ctrl_t upgrade_ctrl;
+static bool upgrade_err = false;
+
+#define DATALEN 1024
+/* 这个主要是升级检验时，做数据缓存，提高
+校验速度，以后如果空间不够，可以动态分配
+*/
+u_int8_t databuf[DATALEN] = {0};
+
+LOCAL void ICACHE_FLASH_ATTR sys_upgrade_reset(void)
+{
+	upgrade_ctrl_t *pctrl = &upgrade_ctrl;
+	pctrl->s = NULL;
+	Md5_Init(&pctrl->ctx);
+	pctrl->upgrade_finish = false;
+	pctrl->upgrade_last_block = 0;
+	pctrl->image_size_check = 0;
+
+	pctrl->flash_addr = pctrl->upgrade_user_bin_start;
+	pctrl->addr = pctrl->upgrade_user_bin_start;
+	pctrl->upgrade_addr = pctrl->upgrade_user_bin_start;
+	pctrl->sum_len = 0;
+
+	pctrl->chk_sum = CHECKSUM_INIT;
+	pctrl->chk_sum_new = CHECKSUM_INIT;
+	pctrl->seg_size = FW_IMG_SIZE_MAX;
+	pctrl->seg_type = BLOCK1_HEAD_1;
+
+	os_memset(pctrl->md5_cal, 0, sizeof(pctrl->md5_cal));
+
+	iw_timer_delete(TID_UPGRADE_TIMER);
+}
+
+void ICACHE_FLASH_ATTR sys_upgrade_init(void)
+{
+	os_memset(&upgrade_ctrl, 0, sizeof(upgrade_ctrl));
+	system_upgrade_flag_set(UPGRADE_FLAG_IDLE);
+	//从flash中读取当前生效镜像1还是2，并将升级参数设置为另一个，在reboot之前，需要修改启动系统参数
+	if (system_upgrade_userbin_check() == UPGRADE_FW_BIN1) {
+		UPGRADE_ERROR("it will use bin[2] to next time upgrade!\r\n");
+		upgrade_ctrl.upgrade_type = UPGRADE_FW_BIN2;
+		upgrade_ctrl.upgrade_user_bin_start = UPGRADE_USER2_ADDR;
+	} else {
+		UPGRADE_ERROR("it will use bin[1] to next time upgrade!\r\n");
+		upgrade_ctrl.upgrade_type = UPGRADE_FW_BIN1;
+		upgrade_ctrl.upgrade_user_bin_start = UPGRADE_USER1_ADDR;
+	}
+
+	sys_upgrade_reset();
+}
+
+//避免升级不成功后一直不能升级或重启后升级
+LOCAL rs_t ICACHE_FLASH_ATTR sys_upgrade_timer(void *arg)
+{
+	if (upgrade_ctrl.upgrade_finish == false) {
+		sys_upgrade_init();
+	}
+
+	return 0;
+}
+
+LOCAL void ICACHE_FLASH_ATTR sys_upgrade_timeron(void)
+{
+
+	iw_timer_delete(TID_UPGRADE_TIMER);
+	iw_timer_set(TID_UPGRADE_TIMER, TIME_N_SECOND(SYS_UPGRADE_TIMER_DIE), 0, sys_upgrade_timer, NULL);
+
+}
+
+//初始化一下烧写地址等
+LOCAL bool ICACHE_FLASH_ATTR sys_upgrade_check_block(u_int16_t block)
+{
+	if (upgrade_ctrl.upgrade_last_block == block) {
+		return false;
+	}
+
+	if (block == SYS_UPGRADE_FIRST_BLOCK) {
+		sys_upgrade_reset();
+		//这里开启定时器，避免升级失败可以再次升级
+		sys_upgrade_timeron();
+		UPGRADE_INFO("----------------------------------------------first block at : %ds\r\n", get_sec());
+	}
+
+	return true;
+}
+
+LOCAL bool ICACHE_FLASH_ATTR sys_upgrade_check_block2(u_int16_t block)
+{
+	upgrade_ctrl_t *pctrl = &upgrade_ctrl;
+
+	if (block != (pctrl->upgrade_last_block + 1)) {
+		UPGRADE_ERROR("error block=%u last_block=%u\n",
+		              block, pctrl->upgrade_last_block);
+		return false;
+	}
+
+	return true;
+}
+
+//镜像md5检测函数
+LOCAL bool ICACHE_FLASH_ATTR sys_upgrade_md5_check(u_int8_t *md5)
+{
+//	int i;
+	upgrade_ctrl_t *pctrl = &upgrade_ctrl;
+
+	Md5_Final(pctrl->md5_cal, &pctrl->ctx);
+
+	if (os_memcmp(pctrl->md5_cal, md5, MD5_SIZE) != 0) {
+		UPGRADE_ERROR("md5 check failed\n");
+		mem_dump("md5_cal", pctrl->md5_cal, MD5_SIZE);
+		mem_dump("md5", md5, MD5_SIZE);
+		return false;
+	}
+
+	return true;
+}
+
+//检查当前block是否已经达到了需要的镜像位置，如果已经到达，则返回有效的data_len，否则，返回0
+LOCAL u_int16_t ICACHE_FLASH_ATTR sys_upgrade_waitfor_userblock(u_int32_t data_len)
+{
+	upgrade_ctrl_t *pctrl = &upgrade_ctrl;
+	//用于返回的有效长度
+	u_int16_t efficent_len = 0;
+
+	pctrl->sum_len += data_len;
+	if (pctrl->sum_len >= upgrade_ctrl.upgrade_user_bin_start) {
+		efficent_len = pctrl->sum_len - (upgrade_ctrl.upgrade_user_bin_start);
+
+		UPGRADE_ERROR("-------sys_upgrade_waitfor_userblock-----------------------------%08x, %08x\r\n", pctrl->sum_len, efficent_len);
+		//UPGRADE_FLAG_IDLE->UPGRADE_FLAG_START
+		system_upgrade_flag_set(UPGRADE_FLAG_START);
+	}
+
+	return efficent_len;
+}
+
+//分片写入备份分区
+LOCAL bool ICACHE_FLASH_ATTR sys_upgrade_block(u_int16_t block, u_int8_t *data, u_int32_t data_len)
+{
+	bool ret = true;
+	upgrade_ctrl_t *pctrl = &upgrade_ctrl;
+	u_int32_t block_data_len = data_len;
+
+
+	UPGRADE_DEBUG("the cur block=%u write addr=%08x data_len=%u,,,,upgrade_flag%08x\n",
+	              block, pctrl->upgrade_addr, data_len, system_upgrade_flag_check());
+	UPGRADE_DEBUG("begin data:%08x, %08x, %08x, %08x, %08x, %08x, %08x, %08x, %08x, %08x, %08x, %08x, %08x, %08x, %08x, %08x\r\n",
+	              *data, *(data + 1), *(data + 2), *(data + 3), *(data + 4), *(data + 5), *(data + 6), *(data + 7), *(data + 8),
+	              *(data + 9), *(data + 10), *(data + 11), *(data + 12), *(data + 13), *(data + 14), *(data + 15));
+
+	//上层做地址校验，避免升级失败丢失配置。
+	if ((pctrl->image_size_check + data_len) >= UPGRADE_USER2_ADDR + FW_IMG_SIZE_MAX ||
+	    pctrl->upgrade_addr < upgrade_ctrl.upgrade_user_bin_start) {
+		UPGRADE_ERROR("error write addr=%08x data_len=%u imagesize=%u\n",
+		              pctrl->upgrade_addr, data_len, pctrl->image_size_check);
+		return false;
+	}
+	pctrl->upgrade_last_block = (int)block;
+	pctrl->image_size_check += data_len;
+	Md5_Update(&pctrl->ctx, data, data_len);
+	//检测是否与当前的user选择一致，在接收到属于当前需求的位置之前，纯粹跳过，不写flash
+	if (system_upgrade_flag_check() == UPGRADE_FLAG_IDLE) {
+		data_len = sys_upgrade_waitfor_userblock(block_data_len);
+		if (data_len != 0) {
+
+			data += (block_data_len - data_len);
+
+			UPGRADE_DEBUG("begin data:%08x, %08x, %08x, %08x, %08x, %08x, %08x, %08x, %08x, %08x, %08x, %08x, %08x, %08x, %08x, %08x\r\n",
+			              *data, *(data + 1), *(data + 2), *(data + 3), *(data + 4), *(data + 5), *(data + 6), *(data + 7), *(data + 8),
+			              *(data + 9), *(data + 10), *(data + 11), *(data + 12), *(data + 13), *(data + 14), *(data + 15));
+
+		} else {
+			return ret;
+		}
+	}
+	if (pctrl->upgrade_type == UPGRADE_FW_BIN1) {
+		if (pctrl->upgrade_addr + data_len > FW_USER1_UP) {
+			return ret;
+		}
+	}
+	if (flash_write(pctrl->upgrade_addr, data_len, data) == true) {
+		//成功后更新数据及块
+		pctrl->upgrade_addr += data_len;
+
+		sys_upgrade_timeron();
+	} else {
+		ret = false;
+	}
+
+	return ret;
+}
+
+//手机客户端锁定
+LOCAL bool ICACHE_FLASH_ATTR sys_upgrade_client_check(void *s)
+{
+	if (upgrade_ctrl.s == NULL) {
+		upgrade_ctrl.s = s;
+		return true;
+	}
+
+	if (upgrade_ctrl.s == s) {
+		return true;
+	}
+
+	return false;
+}
+
+LOCAL bool ICACHE_FLASH_ATTR sys_upgrade_ok(void)
+{
+	return upgrade_ctrl.upgrade_finish;
+}
+
+void ICACHE_FLASH_ATTR sys_upgrade(void)
+{
+
+	//此处怎样设置选择boot user1 or user2?
+	system_upgrade_flag_set(UPGRADE_FLAG_FINISH);
+	UPGRADE_ERROR("upgrade finished! reboot..........................................\r\n");
+
+	//重启前，disable led灯 gpio口的控制
+	//lede_restart_init();
+
+	system_upgrade_reboot();
+
+	//Reboot_Handler();
+}
+
+LOCAL void ICACHE_FLASH_ATTR sys_upgrade_crc_check_timer_cb(void *cp)
+{
+	//读取四个字节，表示段长度，使用时如非小端系统需要字节序转换
+	u_int32_t tmp_long = 0;
+	bool ret = true;
+	u_int8_t * p = (u_int8_t *)&tmp_long;
+	u_int8_t chk_tail = 0;
+	u_int8_t chk_tail_new = 0;
+	upgrade_ctrl_t *pctrl = &upgrade_ctrl;
+	u_int32_t pad = 0, deadlineaddr = 0, start_addr = 0;
+	u_int32_t *temp;
+
+	//UPGRADE_ERROR("--------------------------------------------sys_upgrade_crc_check_timer_cb\r\n");
+	if (pctrl->crc_stat != CRC_WAIT) {
+		return;
+	}
+	os_timer_disarm(&pctrl->crc_timer);
+	os_timer_setfn(&pctrl->crc_timer, sys_upgrade_crc_check_timer_cb, NULL);
+	os_timer_arm_us(&pctrl->crc_timer, 1, 0);
+	/*
+	* |8    |4|4|len|8    |4|4|len|4|4|len|4|4|len|...|CRC|
+	* |EA...|4|4|len|E9...|4|4|len|4|4|len|4|4|len|...|CRC|
+	*
+	*/
+	/* 大循环是最终目的，计算出终极chk_sum，其他特殊处理的部分，在循环中处理 */
+
+	ret = flash_read_new(pctrl->flash_addr, DATALEN, databuf);
+	if(!ret) {
+		pctrl->crc_stat = CRC_FAILED;
+		return;
+	}
+	deadlineaddr = DATALEN + pctrl->flash_addr;
+	start_addr = pctrl->flash_addr;
+
+//这里加16 是避免对地址的对齐操作，超过获取的值
+	while(deadlineaddr > 16 + pctrl->flash_addr) {
+		/* 用for(;;)作为死循环的原因，居然是，我想要:遍历，所以用，我的用途不是:循环 */
+		/* 退出条件:
+		   read_flash failed
+		   EA和E9 magic error
+		   到达指定目的地CRC
+		   读出非法seg_size
+		*/
+
+		temp = (u_int32_t *)(&(databuf[pctrl->flash_addr - start_addr]));
+		tmp_long = *temp;
+
+		switch(pctrl->seg_type) {
+			case BLOCK1_HEAD_1:
+				UPGRADE_DEBUG("-----------------------------------------------addr:0x%x, 0x%x  0x%x  0x%x  0x%x\r\n", pctrl->flash_addr, *p, *(p+1), *(p+2), *(p+3));
+				if (BIN_MAGIC_IROM != *p) {
+					UPGRADE_ERROR("read addr %08x,----------data:%x,,%x,,%x,,%x", pctrl->flash_addr, *p, *(p + 1), *(p + 2), *(p + 3));
+					UPGRADE_ERROR("Error magic\r\n");
+					pctrl->crc_stat = CRC_FAILED;
+					return;
+				}
+				pctrl->seg_type = BLOCK1_HEAD_2;
+				break;
+			case BLOCK1_HEAD_2:
+				UPGRADE_DEBUG("--------------------------------------------------------------addr:0x%x, 0x%x  0x%x  0x%x  0x%x\r\n", pctrl->flash_addr, *p, *(p+1), *(p+2), *(p+3));
+				pctrl->seg_type = BLOCK1_HEAD_3;
+				break;
+			case BLOCK1_HEAD_3:
+				UPGRADE_DEBUG("------------------------chk_new:0x%x--------------------------------------addr:0x%x, 0x%x  0x%x  0x%x  0x%x\r\n", pctrl->chk_sum_new, pctrl->flash_addr, *p, *(p+1), *(p+2), *(p+3));
+				pctrl->seg_type = BLOCK1_HEAD_4;
+				break;
+			case BLOCK1_HEAD_4:
+				UPGRADE_DEBUG("--------------------------------------------------------------addr:0x%x, 0x%x  0x%x  0x%x  0x%x\r\n", pctrl->flash_addr, *p, *(p+1), *(p+2), *(p+3));
+				pctrl->seg_size = tmp_long;
+				UPGRADE_INFO("----------BLOCK1_DATA--------------seg_size = 0x%x, start from 0x%x\r\n", tmp_long, pctrl->flash_addr + 4);
+				// TODO:合法性检查
+				if(pctrl->seg_size > IROM_TEXT_MAX_SIZE) {
+					UPGRADE_ERROR("Error: iromtext size too large\r\n");
+					pctrl->crc_stat = CRC_FAILED;
+					return;
+				}
+				pctrl->seg_type = BLOCK1_DATA;
+				pctrl->seg_pos = 0;
+				break;
+			case BLOCK1_DATA:
+				pctrl->seg_pos += 4;
+				if(pctrl->seg_pos == pctrl->seg_size) {
+					pctrl->seg_type = BLOCK2_HEAD_1;
+					pctrl->seg_pos = 0;
+					pctrl->seg_size = FW_IMG_SIZE_MAX;
+				}
+				break;
+			case BLOCK2_HEAD_1:
+				UPGRADE_DEBUG("---------------------chk_1:0x%x-----------------------------------------addr:0x%x, 0x%x  0x%x  0x%x  0x%x\r\n", pctrl->chk_sum_new, pctrl->flash_addr, *p, *(p+1), *(p+2), *(p+3));
+				if (BIN_MAGIC_FLASH != *p) {
+					UPGRADE_ERROR("read addr %08x,----------data:%x,,%x,,%x,,%x", pctrl->flash_addr, *p, *(p + 1), *(p + 2), *(p + 3));
+					UPGRADE_ERROR("Error magic\r\n");
+					pctrl->crc_stat = CRC_FAILED;
+					return;
+				}
+				pctrl->seg_type = BLOCK2_HEAD_2;
+				break;
+			case BLOCK2_HEAD_2:
+				UPGRADE_DEBUG("--------------------------------------------------------------addr:0x%x, 0x%x  0x%x  0x%x  0x%x\r\n", pctrl->flash_addr, *p, *(p+1), *(p+2), *(p+3));
+				pctrl->seg_type = BLOCK2_HEAD_3;
+				break;
+			case BLOCK2_HEAD_3:
+				UPGRADE_DEBUG("--------------------------------------------------------------addr:0x%x, 0x%x  0x%x  0x%x  0x%x\r\n", pctrl->flash_addr, *p, *(p+1), *(p+2), *(p+3));
+				pctrl->seg_type = BLOCK2_HEAD_4;
+				break;
+			case BLOCK2_HEAD_4:
+				UPGRADE_DEBUG("--------------------------------------------------------------addr:0x%x, 0x%x  0x%x  0x%x  0x%x\r\n", pctrl->flash_addr, *p, *(p+1), *(p+2), *(p+3));
+				pctrl->seg_size = tmp_long;
+				UPGRADE_INFO("----------BLOCK2_DATA--------------seg_size = 0x%x, start from 0x%x\r\n", tmp_long, pctrl->flash_addr + 4);
+				// TODO:合法性检查
+				if(pctrl->seg_size > FLASH_TEXT_MAX_SIZE) {
+					UPGRADE_ERROR("Error: flash bin blok2 size too large\r\n");
+					pctrl->crc_stat = CRC_FAILED;
+					return;
+				}
+				pctrl->seg_type = BLOCK2_DATA;
+				pctrl->seg_pos = 0;
+				break;
+			case BLOCK2_DATA:
+				pctrl->chk_sum ^= *p ^ *(p + 1) ^ *(p + 2) ^ *(p + 3);
+				pctrl->seg_pos += 4;
+				if(pctrl->seg_pos == pctrl->seg_size) {
+					pctrl->seg_type = BLOCK3_HEAD_1;
+					pctrl->seg_pos = 0;
+					pctrl->seg_size = FW_IMG_SIZE_MAX;
+				}
+				break;
+			case BLOCK3_HEAD_1:
+				UPGRADE_DEBUG("---------------------chk_1:0x%x-----------------------------------------addr:0x%x, 0x%x  0x%x  0x%x  0x%x\r\n", pctrl->chk_sum_new, pctrl->flash_addr, *p, *(p+1), *(p+2), *(p+3));
+				pctrl->seg_type = BLOCK3_HEAD_2;
+				break;
+			case BLOCK3_HEAD_2:
+				UPGRADE_DEBUG("--------------------------------------------------------------addr:0x%x, 0x%x  0x%x  0x%x  0x%x\r\n", pctrl->flash_addr, *p, *(p+1), *(p+2), *(p+3));
+				pctrl->seg_size = tmp_long;
+				UPGRADE_INFO("---------BLOCK3_DATA---------------seg_size = 0x%x, start from 0x%x\r\n", tmp_long, pctrl->flash_addr + 4);
+				// TODO:合法性检查
+				if(pctrl->seg_size > FLASH_TEXT_MAX_SIZE) {
+					UPGRADE_ERROR("Error: flash bin block3 size too large\r\n");
+					pctrl->crc_stat = CRC_FAILED;
+					return;
+				}
+
+				pctrl->seg_type = BLOCK3_DATA;
+				pctrl->seg_pos = 0;
+				break;
+			case BLOCK3_DATA:
+				pctrl->chk_sum ^= *p ^ *(p + 1) ^ *(p + 2) ^ *(p + 3);
+				pctrl->seg_pos += 4;
+				if(pctrl->seg_pos == pctrl->seg_size) {
+					pctrl->seg_type = BLOCK4_HEAD_1;
+					pctrl->seg_pos = 0;
+					pctrl->seg_size = FW_IMG_SIZE_MAX;
+				}
+				break;
+			case BLOCK4_HEAD_1:
+				UPGRADE_DEBUG("---------------------chk_1:0x%x-----------------------------------------addr:0x%x, 0x%x  0x%x  0x%x  0x%x\r\n", pctrl->chk_sum_new, pctrl->flash_addr, *p, *(p+1), *(p+2), *(p+3));
+				pctrl->seg_type = BLOCK4_HEAD_2;
+				break;
+			case BLOCK4_HEAD_2:
+				UPGRADE_INFO("--------------------------------------------------------------addr:0x%x, 0x%x  0x%x  0x%x  0x%x\r\n", pctrl->flash_addr, *p, *(p + 1), *(p + 2), *(p + 3));
+				pctrl->seg_size = tmp_long;
+				UPGRADE_INFO("---------BLOCK4_DATA---------------seg_size = 0x%x, start from 0x%x\r\n", tmp_long, pctrl->flash_addr + 4);
+				// TODO:合法性检查
+				if(pctrl->seg_size > FLASH_TEXT_MAX_SIZE) {
+					UPGRADE_ERROR("Error: flash bin block4 size too large\r\n");
+					pctrl->crc_stat = CRC_FAILED;
+					return;
+				}
+				pctrl->seg_type = BLOCK4_DATA;
+				pctrl->seg_pos = 0;
+				break;
+			case BLOCK4_DATA:
+				pctrl->chk_sum ^= *p ^ *(p + 1) ^ *(p + 2) ^ *(p + 3);
+				pctrl->seg_pos += 4;
+				if(pctrl->seg_pos == pctrl->seg_size) {
+					pctrl->seg_pos = 0;
+					pctrl->seg_size = FW_IMG_SIZE_MAX;
+					//跨过填充0，直取CRC
+					/*
+					 * |end|4|3|CRC|
+					*/
+					pad = 16 - (pctrl->flash_addr + 1 + 4 - pctrl->addr);
+					pad = pad & 0xF;
+					pad -= 3;
+
+					UPGRADE_INFO("-----------------------------------------------addr:0x%x, 0x%x  0x%x  0x%x  0x%x, pad = %d\r\n", pctrl->flash_addr, *p, *(p + 1), *(p + 2), *(p + 3), pad);
+					pctrl->flash_addr += pad;
+
+					pctrl->seg_type = TAIL_CRC;
+				}
+				break;
+			case TAIL_CRC:
+				chk_tail_new = *(p + 2);
+				chk_tail = *(p + 3);
+				UPGRADE_INFO("0x%x  0x%x  0x%x  0x%x pctrl->flash_addr:0x%x------------chk_tail_new:0x%x, chk_sum_new: 0x%x-----------chk_tail:0x%x, chk_sum: 0x%x----\r\n", *p, *(p + 1), *(p + 2), *(p + 3), pctrl->flash_addr, chk_tail_new, pctrl->chk_sum_new, chk_tail, pctrl->chk_sum);
+				pctrl->crc_stat = (chk_tail == pctrl->chk_sum) && (chk_tail_new == pctrl->chk_sum_new) ? CRC_OK : CRC_FAILED;
+				UPGRADE_INFO("----------------------------------------------crc end at : %d\r\n", get_sec());
+				return;
+				break;
+			default:
+				break;
+		}
+
+		pctrl->flash_addr += sizeof(u_int32_t);
+		pctrl->chk_sum_new ^= *p ^ *(p + 1) ^ *(p + 2) ^ *(p + 3);
+
+		pctrl->upgrade_last_block++;
+	}
+
+	return;
+}
+LOCAL rs_t ICACHE_FLASH_ATTR sys_upgrade_crc_result_timer_cb(void *cp)
+{
+	UPGRADE_INFO("------------------flashaddr: 0x%x-------------cnt: %d---------------------%d\r\n", upgrade_ctrl.flash_addr, upgrade_ctrl.upgrade_last_block, upgrade_ctrl.crc_stat);
+	if(upgrade_ctrl.crc_stat == CRC_WAIT) {
+		iw_timer_set(TID_CRC_RESULT_TIMER, TIME_N_SECOND(1), 0, sys_upgrade_crc_result_timer_cb, NULL);
+		return RS_OK;
+	}
+	if(upgrade_ctrl.crc_stat == CRC_OK) {
+		upgrade_ctrl.upgrade_finish = true;
+		sys_upgrade();
+		return RS_OK;
+	}
+	if(upgrade_ctrl.crc_stat == CRC_FAILED) {
+		sys_upgrade_init();
+		return RS_OK;
+	}
+
+	return RS_OK;
+}
+
+LOCAL bool ICACHE_FLASH_ATTR sys_upgrade_crc_check()
+{
+	upgrade_ctrl_t * pctrl = &upgrade_ctrl;
+	pctrl->upgrade_last_block = 0;
+	pctrl->flash_addr = pctrl->upgrade_user_bin_start;
+	//iw_timer_set(TID_CRC_TIMER, 1, 0, sys_upgrade_crc_check_timer_cb, NULL);
+	os_timer_disarm(&pctrl->crc_timer);
+	os_timer_setfn(&pctrl->crc_timer, sys_upgrade_crc_check_timer_cb, NULL);
+	os_timer_arm_us(&pctrl->crc_timer, 1, 0);
+	iw_timer_set(TID_CRC_RESULT_TIMER, TIME_N_SECOND(1), 0, sys_upgrade_crc_result_timer_cb, NULL);
+
+	return true;
+}
+
+void ICACHE_FLASH_ATTR do_ucot_system_upgrade_image(iw_event_info_t *info, iw_obj_t *uobj)//从网上下载镜像
+{
+	u_int8_t *data = NULL;
+	u_int32_t data_len = 0;
+	u_int16_t err = ERR_NONE;
+	u_int8_t *md5_get = NULL;
+	upgrade_header_t *hd = NULL;
+
+	//这里要锁定一下手机客户端，避免多人升级
+	if (sys_upgrade_client_check(info->s) == false) {
+		UPGRADE_ERROR("multi client upgrade now\n");
+		return;
+	}
+
+	//升级成功判断，避免成功后再收到升级包
+	if (sys_upgrade_ok()) {
+		UPGRADE_ERROR("upgrade ok already \n");
+		uc_do_set_reply((ucp_obj_t *)uobj, err);
+		return;
+	}
+
+	/* 主动请求升级回复报文 */
+	if (info->action == UCA_GET) {
+		uc_do_set_reply((ucp_obj_t *)uobj, err);
+		return;
+	}
+
+	if (info->action != UCA_SET) {
+		UPGRADE_ERROR("only support set\n");
+		return;
+	}
+
+	if (uobj->param_len < UPGRADE_HEADER_SIZE) {
+		UPGRADE_ERROR("error param");
+		return;
+	}
+
+	hd = (upgrade_header_t *)(info + 1);
+	hd->current_block = htons(hd->current_block);
+	hd->total_block = htons(hd->total_block);
+	UPGRADE_ERROR("total block: %d, current block: %d\r\n", hd->total_block, hd->current_block);
+
+	data = (u_int8_t *)&hd[1];
+	data_len = uobj->param_len - UPGRADE_HEADER_SIZE;
+
+	if (hd->total_block == 0 ||
+	    hd->current_block > hd->total_block) {
+		UPGRADE_ERROR("error block cur=%u total=%u\n", hd->current_block, hd->total_block);
+		return;
+	}
+
+	//判断是否相同的分片，如果是直接回OK
+	if(sys_upgrade_check_block(hd->current_block) == false) {
+		UPGRADE_ERROR("sys_upgrade_check_block  retry block=%u\n", hd->current_block);
+		uc_do_set_reply((ucp_obj_t *)uobj, err);
+		return;
+	}
+
+	//判断是否与上次分片离得较远，这样就没用了，错误返回
+	if(sys_upgrade_check_block2(hd->current_block) == false) {
+		UPGRADE_ERROR("sys_upgrade_check_block2 block=%u\n", hd->current_block);
+		return ;
+	}
+
+	//判断一下分片是否到最后了
+	if (hd->total_block == hd->current_block) {
+		if (data_len != MD5_SIZE) {
+			UPGRADE_ERROR("error md5 len=%u\n", data_len);
+			return;
+		}
+		md5_get = data;
+
+		//md5验证
+		if (sys_upgrade_md5_check(md5_get) == false) {
+			UPGRADE_ERROR("image md5 check failed\n");
+			return;
+		}
+
+		upgrade_ctrl.upgrade_finish = true;
+
+		UPGRADE_INFO("----------------------------------------------last block at : %ds\r\n", get_sec());
+		UPGRADE_ERROR("upgrade download finished: total size is %d(%dk)Byte, start the CRC check\r\n", upgrade_ctrl.image_size_check, upgrade_ctrl.image_size_check / 1024);
+		sys_upgrade_crc_check();
+	} else {
+		UPGRADE_DEBUG("hd->total_block=%u hd->current_block=%u\n", hd->total_block, hd->current_block);
+		if (sys_upgrade_block(hd->current_block, data, data_len) == false) {//分片写入备份区
+			UPGRADE_ERROR("upgrade block failed\n");
+			upgrade_err = true;
+			return ;
+		}
+	}
+
+	uc_do_set_reply((ucp_obj_t *)uobj, err);
+}
+
+

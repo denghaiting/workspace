@@ -1,0 +1,52 @@
+/**************************************************************************
+**  Copyright (c) 2011 GalaxyWind, Ltd.
+**
+**  Project: ucd_ap_monitor
+**  File:    ucd_ap_monitor.h
+**  Author:  yuanchao.wong@gmail.com
+**  Date:    04/23/2015
+**
+**  Purpose:
+**    Ucd_ap_monitor.
+**************************************************************************/
+
+
+#ifndef UCD_AP_MONITOR_H
+#define UCD_AP_MONITOR_H
+
+
+#ifdef __cplusplus
+extern "C"
+{
+#endif /* __cplusplus */
+
+/* Macro constant definitions. */
+
+
+/* Type definitions. */
+
+
+/* External function declarations. */
+/*
+	功能:
+		开始wifi连接检查，如果wifi没有配置，不进行检查
+	输入参数:
+	输出参数:
+	返回值:
+	说明:
+*/
+void uam_start(void);
+
+/* Macro API definitions. */
+
+
+/* Global variable declarations. */
+
+
+
+#ifdef __cplusplus
+} /* extern "C" */
+#endif /* __cplusplus */
+
+#endif /* UCD_AP_MONITOR_H */
+

@@ -1,0 +1,43 @@
+/**************************************************************************
+**  Copyright (c) 2010 GalaxyWind, Ltd.
+**
+**  Project: iw_uart_ijuartpro.c
+**  File:    iw_uart_ijuartpro.c
+**  Author:  
+**  Date:    06/09/2015
+**
+**  Purpose:
+**    I+ uart proto prase.
+**************************************************************************/
+
+
+/* Include files. */
+#include "iw_priv.h"
+
+
+/* Macro constant definitions. */
+
+
+/* Type definitions. */
+
+
+/* Local function declarations. */
+
+
+/* Macro API definitions. */
+
+
+/* Global variable declarations. */
+static rs_t ICACHE_FLASH_ATTR iw_uart_2ijuartproto(iw_event_info_t *INOUT_info)
+{
+
+	return RS_OK;
+}
+
+
+void ICACHE_FLASH_ATTR iw_uart_ijuartproto_init(void)
+{
+	iw_event_register(IW_EV_UARTR_2IJPROTO, iw_uart_2ijuartproto);
+}
+
+

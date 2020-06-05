@@ -1,0 +1,1181 @@
+/**************************************************************************
+**  Copyright (c) 2011 GalaxyWind, Ltd.
+**
+**  Project: LEDE_LED
+**  File:    lede_led.c
+**  Author:  zhaogang
+**  Date:    06/02/2015
+**
+**  Purpose:
+**    LEDE
+**************************************************************************/
+
+
+/* Include files. */
+#include "c_types.h"
+#include "iw_api.h"
+#include "iw_lede.h"
+#include "iw_lan_srv.h"
+#include "eagle_soc.h"
+#include "ds_proto.h"
+#include "osapi.h"
+#include "iw_priv.h"
+#include "iw_push.h"
+#include "iw_flash.h"
+#include "iw_user_config.h"
+#include "iw_dev_timer.h"
+#include "iw_smartconfig.h"
+
+//#define LEDE_DEBUG_
+#ifdef LEDE_DEBUG_
+#define LEDE_INFO(x...)  ERROR(x)
+#define LEDE_DEBUG(x...) ERROR(x)
+#define LEDE_ERROR(x...)  ERROR(x)
+#else
+#define LEDE_DEBUG(x...)
+#define LEDE_INFO(x...)
+#define LEDE_ERROR(x...) ERROR(x)
+#endif
+
+#define 	LEDE_PAVITE_MODE_BEGIN       10
+#define     LEDE_PAVITE_MODE_END        (LEDE_PAVITE_MODE_BEGIN+5)
+
+#define     DEFAULT_MODE                 16
+
+#define     DEFAULT_TIME                 lede_param.duty
+//500HZ
+#define     LEDE_FREQ                     500
+//低电平点亮led灯
+#define     LOW_LIGHT                    1
+
+#define bb(a) a->reason, a->exccause, a->epc1, a->epc2, a->epc3, a->excvaddr, a->depc
+
+//XXX: 0xffffffff/(80000000/16)=35A
+#define US_TO_RTC_TIMER_TICKS(t)          \
+    ((t) ?                                   \
+     (((t) > 0x35A) ?                   \
+      (((t)>>2) * ((APB_CLK_FREQ>>4)/250000) + ((t)&0x3) * ((APB_CLK_FREQ>>4)/1000000))  :    \
+      (((t) *(APB_CLK_FREQ>>4)) / 1000000)) :    \
+     0)
+
+#define FRC1_ENABLE_TIMER  BIT7
+
+//TIMER PREDIVED MODE
+typedef enum {
+    DIVDED_BY_1 = 0,		//timer clock
+    DIVDED_BY_16 = 4,	//divided by 16
+    DIVDED_BY_256 = 8,	//divided by 256
+} TIMER_PREDIVED_MODE;
+
+typedef enum {			//timer interrupt mode
+    TM_LEVEL_INT = 1,	// level interrupt
+    TM_EDGE_INT   = 0,	//edge interrupt
+} TIMER_INT_MODE;
+
+
+enum{
+	COPY_TYPE_ALL,
+	COPY_TYPE_SMART,
+	COPY_TYPE_TIMER_SET,
+	COPY_TYPE_MAX
+};
+
+u_int8_t	channel_gpio[5] = {
+	RED_GPIO,
+	GREEN_GPIO,
+	BLUE_GPIO,
+	WARM_GPIO,
+	COLD_GPIO
+};
+
+typedef struct
+{
+u_int8_t red;        // [0,255]
+u_int8_t green;      // [0,255]
+u_int8_t blue;        // [0,255]
+} COLOR_RGB;
+
+typedef struct
+{
+  float hue;        // [0,360]
+  float saturation;    // [0,100]
+  float luminance;    // [0,100]
+} COLOR_HSL;
+
+  /*ticks = 2ms*/
+typedef struct
+{
+	int is_next;
+	int ticks;
+	u_int16_t channel_val[5];
+} color_step_t; 
+
+typedef struct 
+{
+    u_int16_t period;
+    u_int16_t freq;
+	u_int16_t one_time;
+    u_int8_t  duty;
+	
+}lede_param_t;
+
+typedef struct{
+	u_int8_t times;				/*断电此标志为零，复位键和手机复位都为1。 0代表关机，1代表和上一次的状态一致*/
+	u_int8_t pad;
+}by_poweronofftimes_restore_t;
+
+by_poweronofftimes_restore_t poweronofftimes = {0,0};
+
+u_int8_t onoff_statue_flag = 0; 
+
+ia_lede_led_state_t lede_led_state = {255, 0, 255, 50, 0, 1, 0, 0};
+
+ia_lede_led_pwm_ctl_t g_pwm_int_ctl[6] = {
+		{0, 40760, 0}
+};
+volatile int g_pwm_int_ctl_flag = 2;
+
+static int is_smart_config = 0;
+color_step_t color_step[20] = {{0,0,{0}}};
+u_int16_t channel_val[5] = {0};
+int color_init_index = 1;
+int color_final_index = 1;
+int cur_tick = 0;
+
+int sign = 0;
+int g_seq = 0;
+lede_param_t lede_param;
+
+/*mode 1*/
+color_step_t mode_flash[12] = {
+		{1, 100, {255 ,	0, 		0, 	0, 0}},
+		{1, 255, {255 ,	0, 		0, 	0, 0}},
+		{1, 100, {255 , 	255 , 	0, 	0, 0}},
+		{1, 255, {255 , 	255 , 	0, 	0, 0}},
+		{1, 100, {0, 	255 , 	0, 0, 0}},
+		{1, 255, {0, 	255 , 	0, 0, 0}},
+		{1, 100, {0, 	255 , 	255 , 0, 0}},
+		{1, 255, {0, 	255 , 	255 , 0, 0}},
+		{1, 100, {0, 	0, 		255 , 	0, 0}},
+		{1, 255, {0, 	0, 		255 , 	0, 0}},
+		{0, 100, {255 , 	0, 		255 , 0, 0}},
+		{0, 255, {255 , 	0, 		255 , 0, 0}}
+};
+
+/*mode 2*/
+color_step_t mode_beat[2] = {
+		{1, 255, {0,	0, 		0, 	0, 0}},
+		{0, 255, {255 , 	0, 		255 , 	0, 0}}
+};
+
+/*mode 3*/
+color_step_t mode_wake_up[2] = {
+		{1, 255, {0, 0, 0, 0, 0}},
+		{0, -1, {132 , 193 , 255 , 0, 0}}
+};
+
+/*mode 4*/
+color_step_t mode_sleep[1] = {
+		{0, -1, {50 , 20 , 0, 0, 0}}
+};
+
+/*mode 5*/
+color_step_t mode_party[5] = {
+		{1, 500, {255, 0, 0, 0, 0}},
+		{1, 500, {175, 64, 255, 0, 0}},
+		{1, 500, {64, 233, 255, 0, 0}},
+		{1, 500, {250, 167, 85, 0, 0}},
+		{0, 500, {255, 67, 64, 0, 0}}
+};
+
+
+/*mode 6*/
+color_step_t mode_read[1] = {
+		{0, -1, {0, 255 , 0, 0, 0}}
+};
+
+/*mode 7*/
+color_step_t mode_exercise[1] = {
+		{0, -1, {0, 0, 0, 255 , 0}}
+};
+
+/*mode 8*/
+color_step_t mode_thinking[1] = {
+		{0, -1, {175 , 207 , 200 , 0, 0}}
+};
+
+/*mode 9*/
+color_step_t mode_eating[1] = {
+		{0, -1, {255 , 128 , 0, 0, 0}}
+};
+
+/*mode 10*/
+color_step_t mode_fast[2] = {
+		{1, 30, {0,	    0, 		0, 	0, 0}},
+		{0, 30, {0, 	0, 		255 , 	0, 0}}
+};
+
+/*mode 11*/
+color_step_t mode_crazy[2] = {
+		{1, 10, {0,	    0, 		0, 	0, 0}},
+		{0, 10, {0, 	0, 		255 , 	0, 0}}
+};
+
+/*mode 12*/
+color_step_t mode_lazy[] = {
+		{1, 500, {0,	0, 		255, 	0, 0}},
+		{0, 250, {0, 	0, 		0 , 	0, 0}}
+};
+
+/*mode 13 :3sON_200ms*/
+color_step_t mode_3son[] = {
+		{1, 100, {0,	0, 		0, 	0, 0}},
+		{1, 250, {0, 	0, 		255 , 	0, 0}},
+		{1, 250, {0, 	0, 		255 , 	0, 0}},
+		{1, 250, {0, 	0, 		255 , 	0, 0}},
+		{1, 250, {0, 	0, 		255 , 	0, 0}},
+		{1, 250, {0, 	0, 		255 , 	0, 0}},
+		{0, 250, {0, 	0, 		255 , 	0, 0}}
+};
+
+/*mode 14*/
+color_step_t mode_off[] = {
+		{0, -1, {0, 	0, 		0, 	0, 0}}
+};
+
+/*mode 15*/
+color_step_t mode_on[] = {
+		{0, -1, {0,	    0, 		255 , 	0, 0}}
+};
+/*mode 16*/
+color_step_t mode_all_on[] = {
+		{0, -1, {255 ,	 255, 	255 , 	0, 0}},
+};
+/*mode 17*/
+color_step_t mode_flsh_1s[] = {
+		{1, 500, {255 ,	 0, 	0, 	0, 0}},
+		{1, 1, {0 ,	 0, 	0, 	0, 0}},
+		{1, 500, {0 ,	 255, 	0, 	0, 0}},
+		{1, 1, {0 ,	 0,	0,	0, 0}},
+		{1, 500, {0 ,	 0, 	255, 	0, 0}},
+		{1, 1, {0 ,	 0, 	255, 	0, 0}},
+		{1, 500, {0 ,	 0, 	0,	255, 0}},
+		{0, 1, {0 ,	 0, 	0,	0, 0}},
+
+};
+/*mode 18*/
+color_step_t mode_red[1] = {
+		{0, -1, {255 ,	0,  0,	0, 0}},
+
+};
+
+
+u_int8_t ready_to_start = 0;
+static void lede_modify_status(void);
+static void lede_led_config_init(void);
+static void change_mode_id(int id);
+static void set_smart_config();
+extern bool is_test_ssid(void);
+extern int iw_sys_timer(void *arg);
+void lede_led_timer_proc(void *pdata);
+void lede_led_timer_proc(void *pdata);
+void lede_gpio_init(void);
+
+static void ICACHE_FLASH_ATTR
+lede_set_freq_duty(u_int16_t freq,u_int16_t duty)
+{
+    if (freq > 500) {
+        lede_param.freq = 500;
+    } else if (freq < 1) {
+        lede_param.freq = 1;
+    } else {
+        lede_param.freq = freq;
+    }
+
+    lede_param.period = PER_1S_US / lede_param.freq;
+	lede_param.duty = duty;
+	lede_param.one_time = lede_param.period / duty;//7
+	LEDE_DEBUG("one_time=[%d], duty=[%d], period=[%d], freq=[%d]\r\n", lede_param.one_time, lede_param.duty, lede_param.period, lede_param.freq);
+}
+
+void ICACHE_FLASH_ATTR lede_led_state_copy(void * pd, void * ps, int type)
+{
+	ia_lede_led_state_t *d, *s;
+
+	d = (ia_lede_led_state_t*)pd;
+	s = (ia_lede_led_state_t*)ps;
+
+	memcpy((u_int8_t *)d, (u_int8_t *)s, sizeof(ia_lede_led_state_t));
+
+	LEDE_DEBUG("type:%d dst state: R=%d, G=%d, B=%d, L=%d, cold=%d, power=%d, mod_id=%d, action = %d\n", 
+	type,d->R, d->G, d->B, d->L, d->cold, d->power, d->mod_id, d->action);
+	LEDE_DEBUG("type:%d src state: R=%d, G=%d, B=%d, L=%d, cold=%d, power=%d, mod_id=%d, action = %d\n", 
+	type,s->R, s->G, s->B, s->L, s->cold, s->power, s->mod_id, s->action);
+}
+
+
+static int min_channel(u_int16_t * channel){
+	int i, val = DEFAULT_TIME;
+
+	for (i = 0; i < 5; i++) {
+		if (val > channel[i])
+			val = channel[i];
+	}
+
+	return val;
+}
+
+/*
+*	channel_val是PWM的占空比的份额
+*	
+*	g_pwm_int_ctl, 模拟PWM需要改变波形方向的中断时间
+*
+*	算法:
+*		在一个周期中:
+*		1.从5路中选择最小占空比的1路，计算下次需要产生的中断时间。
+*		2.从剩余路数中选择最小占空比，计算下次需要产生中断的时间。
+*
+*	注意:
+*
+*		1.参数中断的方式使用time1硬件定时器的溢出中断
+*		2.总路数的占空比不能超过1. 即当只有1路时，PWM可以全功率输出。当有多路时，亮度要等比降低输出。
+*/
+static void cal_pwm_ctrl(void)
+{
+#define MOST_DUTY  250
+	int i, j, min_val, last_min_val = 0;
+	u_int16_t channel_val_tmp[5];
+	u_int32_t sum = 0;
+	
+	channel_val_tmp[0] = channel_val[0];
+	channel_val_tmp[1] = channel_val[1];
+	channel_val_tmp[2] = channel_val[2];
+	channel_val_tmp[3] = channel_val[3];
+	channel_val_tmp[4] = channel_val[4];
+
+	//LEDE_DEBUG("ctrl R(%d),G(%d),B(%d),W(%d),C(%d)\r\n", channel_val[0], channel_val[1], channel_val[2], channel_val[3], channel_val[4]);
+	//保证空占比之合不超过255
+	sum = channel_val_tmp[0] + channel_val_tmp[1] + channel_val_tmp[2] + 
+			channel_val_tmp[3] + channel_val_tmp[4];
+	if (sum > MOST_DUTY) {
+		channel_val_tmp[0] = channel_val_tmp[0]*MOST_DUTY/sum;
+		channel_val_tmp[1] = channel_val_tmp[1]*MOST_DUTY/sum;
+		channel_val_tmp[2] = channel_val_tmp[2]*MOST_DUTY/sum;
+		channel_val_tmp[3] = channel_val_tmp[3]*MOST_DUTY/sum;
+		channel_val_tmp[4] = channel_val_tmp[4]*MOST_DUTY/sum;
+	}
+
+	g_pwm_int_ctl[0].next = 0;
+	for (i = 0; i < 5; i++){
+		if(channel_val_tmp[i] > 0){
+			g_pwm_int_ctl[0].gpio_map |= 1 << channel_gpio[i];
+		} else {
+			g_pwm_int_ctl[0].gpio_map &= ~(1 << channel_gpio[i]);
+			channel_val_tmp[i] = DEFAULT_TIME;
+		}
+	}
+
+	for (i = 0; i < 5; i++){
+		min_val = min_channel(channel_val_tmp);
+		if (min_val >= DEFAULT_TIME) {
+			break;
+		} else {
+			g_pwm_int_ctl[i].next = i+1;
+		}
+
+		g_pwm_int_ctl[i].sleep = min_val - last_min_val;
+		if(g_pwm_int_ctl[i].sleep <= 0)
+			g_pwm_int_ctl[i].sleep = 1;
+
+		//sleep是占空比(每一阶段变化的)，one_time是一个pwm周期可以分为的最小粒度
+		g_pwm_int_ctl[i].sleep = 
+		US_TO_RTC_TIMER_TICKS(g_pwm_int_ctl[i].sleep*lede_param.one_time);
+		
+		for (j = 0; j < 5; j++){
+			if(channel_val_tmp[j] == min_val){
+				g_pwm_int_ctl[i + 1].gpio_map |= 1 << channel_gpio[j];
+				channel_val_tmp[j] = DEFAULT_TIME;
+			} else {
+				g_pwm_int_ctl[i + 1].gpio_map &= ~(1 << channel_gpio[j]);
+			}
+		}
+		last_min_val = min_val;
+	}
+
+	g_pwm_int_ctl[i].sleep = DEFAULT_TIME - last_min_val;
+	if(g_pwm_int_ctl[i].sleep <= 0)
+			g_pwm_int_ctl[i].sleep = 1;
+
+	g_pwm_int_ctl[i].sleep = 
+	US_TO_RTC_TIMER_TICKS(g_pwm_int_ctl[i].sleep*lede_param.one_time);
+
+	g_pwm_int_ctl[i].next = 0;
+
+#if 0
+	for (i = 0; i < 6; i++){
+		LEDE_DEBUG("%d: map = %x, sleep = %d, next = %d\n", i, g_pwm_int_ctl[i].gpio_map, g_pwm_int_ctl[i].sleep, g_pwm_int_ctl[i].next);
+		for( j = 0; j < 5; j++){
+			if((1 << channel_gpio[j]) & g_pwm_int_ctl[i].gpio_map)
+				LEDE_DEBUG("%d ", j);
+		}
+		LEDE_DEBUG("\n");
+	}
+#endif
+
+}
+
+static void  ICACHE_FLASH_ATTR lede_led_apply_mode(int mode){
+
+	g_pwm_int_ctl_flag = 1;
+
+	switch(mode){
+
+		case 1:
+			os_memcpy(&color_step[1], mode_flash, sizeof(mode_flash));
+		break;
+
+		case 2:
+			os_memcpy(&color_step[1], mode_beat, sizeof(mode_beat));
+		break;
+
+		case 3:
+			os_memcpy(&color_step[1], mode_wake_up, sizeof(mode_wake_up));
+		break;
+
+		case 4:
+			os_memcpy(&color_step[1], mode_sleep, sizeof(mode_sleep));
+		break;
+
+		case 5:
+			os_memcpy(&color_step[1], mode_party, sizeof(mode_party));
+		break;
+
+		case 6:
+			os_memcpy(&color_step[1], mode_read, sizeof(mode_read));
+		break;
+
+		case 7:
+			os_memcpy(&color_step[1], mode_exercise, sizeof(mode_exercise));
+		break;
+
+		case 8:
+			os_memcpy(&color_step[1], mode_thinking, sizeof(mode_thinking));
+		break;
+
+		case 9:
+			os_memcpy(&color_step[1], mode_eating, sizeof(mode_eating));
+		break;
+
+		case 10:
+			os_memcpy(&color_step[1], mode_fast, sizeof(mode_fast));
+		break;
+
+		case 11:
+			os_memcpy(&color_step[1], mode_crazy, sizeof(mode_crazy));
+		break;
+				
+		case 12:
+			os_memcpy(&color_step[1], mode_lazy, sizeof(mode_lazy));
+		break;
+
+		case 13:
+			os_memcpy(&color_step[1], mode_3son, sizeof(mode_3son));
+		break;
+		
+		case 14:
+			os_memcpy(&color_step[1], mode_off, sizeof(mode_off));
+		break;
+		
+		case 15:
+			os_memcpy(&color_step[1], mode_on, sizeof(mode_on));
+		break;
+
+		case 16:
+			os_memcpy(&color_step[1], mode_all_on, sizeof(mode_all_on));
+		break;
+		
+		case 17:
+			os_memcpy(&color_step[1], mode_flsh_1s, sizeof(mode_flsh_1s));
+		break;
+
+		case 18:
+			os_memcpy(&color_step[1], mode_red, sizeof(mode_red));
+		break;
+		default:
+			os_memcpy(&color_step[1], mode_flash, sizeof(mode_flash));
+		break;
+	}
+
+	LEDE_DEBUG("mode=%d\r\n", mode);
+	
+	g_pwm_int_ctl_flag = 2;
+}
+
+static void ICACHE_FLASH_ATTR lede_led_do_state()
+{
+	int w, ww, wc;
+	u_int16_t	channel_val_tmp[5];
+	
+	LEDE_INFO("R%d, G%d, B%d, L%d, C%d, Power%d, Action%d, Mod%d\r\n", 
+		lede_led_state.R, lede_led_state.G, lede_led_state.B, lede_led_state.L, lede_led_state.cold, lede_led_state.power, lede_led_state.action, lede_led_state.mod_id);
+
+	g_pwm_int_ctl_flag = 1;
+		
+	if(lede_led_state.L < 66 && 0 < lede_led_state.L){//解决频率影响闪烁的问题
+		sign = 1;
+	}else{
+		sign = 0;
+	}		
+	if ((lede_led_state.mod_id == 0) || (lede_led_state.power == 0)) {
+		if (lede_led_state.action == 0) {	
+			channel_val_tmp[0] = (u_int16_t)lede_led_state.R * (lede_led_state.L + 4 * sign) / 100  ;
+			channel_val_tmp[1] = (u_int16_t)lede_led_state.G * (lede_led_state.L + 4 * sign) / 100  ;
+			channel_val_tmp[2] = (u_int16_t)lede_led_state.B * (lede_led_state.L + 4 * sign) / 100  ;			
+			channel_val_tmp[3] = 0;
+			channel_val_tmp[4] = 0;		
+		} else {
+			w = 255 * (lede_led_state.L + 4 * sign)/ 100;
+
+			wc = w * lede_led_state.cold / 100;
+			ww = w - wc;
+			channel_val_tmp[0] = 0;
+			channel_val_tmp[1] = 0;
+			channel_val_tmp[2] = 0;
+			channel_val_tmp[3] = ww  ;
+			channel_val_tmp[4] = wc  ;
+		}
+
+		if(lede_led_state.power == 0) {
+			channel_val_tmp[0] = 0;
+			channel_val_tmp[1] = 0;
+			channel_val_tmp[2] = 0;
+			channel_val_tmp[3] = 0;
+			channel_val_tmp[4] = 0;
+		}
+
+		LEDE_DEBUG("RGBWC(%d, %d, %d, %d, %d)\r\n", 
+			channel_val_tmp[0], channel_val_tmp[1], channel_val_tmp[2], channel_val_tmp[3], channel_val_tmp[4]);
+
+		os_memcpy(color_step[1].channel_val, channel_val_tmp, sizeof(color_step[1].channel_val));
+		color_step[1].is_next = 0;
+		color_step[1].ticks = -1;
+
+	} else {
+		lede_led_apply_mode(lede_led_state.mod_id);
+	}
+
+	os_memcpy(color_step[0].channel_val, channel_val, sizeof(color_step[0].channel_val));
+
+	color_step[0].is_next = 1;
+	color_step[0].ticks = 1;
+	
+	color_init_index = 0;
+	color_final_index = 1;
+	cur_tick = 0;
+
+	g_pwm_int_ctl_flag = 2;
+}
+
+static void ICACHE_FLASH_ATTR ia_do_lede_led_state(iw_event_info_t *info, iw_obj_t *uobj)
+{
+
+	u_int16_t err = ERR_NONE;
+	ia_lede_led_state_t lede_led_state_tmp;
+	char *param = (char *)(uobj + 1);
+	
+	if (!info) {
+		return;
+	}
+
+	if (info->action == UCA_GET) {
+		LEDE_DEBUG("lede led state get\n");
+		LEDE_INFO("R%d, G%d, B%d, L%d, C%d, Power%d, Action%d, Mod%d\r\n", 
+		lede_led_state.R, lede_led_state.G, lede_led_state.B, lede_led_state.L, lede_led_state.cold, lede_led_state.power, lede_led_state.action, lede_led_state.mod_id);
+
+		lede_led_state_copy(&lede_led_state_tmp, &lede_led_state, COPY_TYPE_ALL);
+		
+		uc_put_elemet(uci_send_buf, MAX_UC_PKT_SIZE, &uci_send_index, uobj->objct,
+			uobj->sub_objct, UCAT_LEDE_LED_STATE, sizeof(lede_led_state_tmp), (u_int8_t *)&lede_led_state_tmp);	
+	} else if (info->action == UCA_SET) {
+		LEDE_DEBUG("lede led state set\n");
+		if (uobj->param_len >= sizeof(lede_led_state)) {
+			lede_led_state_copy(&lede_led_state, param, COPY_TYPE_SMART);
+			LEDE_DEBUG("lede led state proc\n");
+			lede_led_do_state();
+			//每秒定时器
+			iw_timer_set(TID_SYS_EVENT_TIMER, TIME_N_SECOND(1), 1, iw_sys_timer, NULL);
+			iw_request_event(EVENT_SYS_SAVE_CONFIG);
+			uc_push_set();
+		} else {
+			err = ERR_PARAM_INVALID;
+		}
+		uc_do_set_reply((ucp_obj_t *)uobj, err);	
+	}	
+}
+
+void ICACHE_FLASH_ATTR lede_led_timer_proc(void *pdata)
+{
+	// TODO:????
+	ucd_period_timer_node_t *node = NULL;
+
+	node = (ucd_period_timer_node_t *)pdata;
+
+	LEDE_INFO("lede_led_timer_proc\r\n");
+
+	lede_led_state_copy(&lede_led_state, node->timer.ext_data, COPY_TYPE_TIMER_SET);
+	lede_led_do_state();
+	iw_request_event(EVENT_SYS_SAVE_CONFIG);
+	uc_push_set();
+}
+
+static void ICACHE_FLASH_ATTR ia_do_lede_led_time(iw_event_info_t *info, iw_obj_t *uobj)
+{	
+	int i = 0;
+	int len = 0;
+	ia_lede_led_timer_t * net_timer;
+	u_int16_t err = ERR_NONE;	
+	u_int8_t *timer_buff = NULL;		
+	ucd_period_timer_node_t *node, *next;
+	net_period_timer_t period_timer;
+	u_int8_t action = info->action;
+	u_int8_t *param = (u_int8_t *)(info + 1);
+
+	if (action == UCA_GET) {
+		stlc_list_for_each_entry_safe(ucd_period_timer_node_t, node, next, &PERIOD_TIMER, link) {
+			i++;
+		}		
+
+		LEDE_DEBUG("timer get count=%d\n", i);
+
+		if (i == 0){
+			uc_put_elemet(uci_send_buf, MAX_UC_PKT_SIZE, &uci_send_index, uobj->objct,
+				uobj->sub_objct, UCAT_LEDE_LED_TIMER, 0, NULL);
+			return;
+		}
+		
+		len = i*sizeof(ia_lede_led_timer_t);
+		timer_buff = iw_calloc(len, 1);
+		if (!timer_buff) {
+			LEDE_ERROR("calloc failed\n");
+			uc_put_elemet(uci_send_buf, MAX_UC_PKT_SIZE, &uci_send_index, uobj->objct,
+				uobj->sub_objct, UCAT_LEDE_LED_TIMER, 0, NULL);
+			return ;
+		}
+		
+		net_timer = (ia_lede_led_timer_t *)timer_buff;
+		stlc_list_for_each_entry_safe(ucd_period_timer_node_t, node, next, &PERIOD_TIMER, link) {
+			net_timer->id= node->timer.id;
+			net_timer->flags= node->timer.enable;
+			net_timer->week_loop= node->timer.week;
+			net_timer->hour= node->timer.hours;
+			net_timer->min= node->timer.minute;
+			lede_led_state_copy(&net_timer->config, node->timer.ext_data, COPY_TYPE_ALL);
+			
+			LEDE_DEBUG("timer id=%u node->enable=%u\n", net_timer->id, net_timer->flags);
+			net_timer++;
+		}
+		uc_put_elemet(uci_send_buf, MAX_UC_PKT_SIZE, &uci_send_index, uobj->objct,
+		uobj->sub_objct, UCAT_LEDE_LED_TIMER, len, (u_int8_t *)timer_buff);
+		iw_free(timer_buff);
+	} else if (action == UCA_SET) {
+		if (uobj->param_len >= sizeof(ia_lede_led_timer_t)) {
+				ia_lede_led_state_t tmp_config;
+				net_timer = (ia_lede_led_timer_t *)param;
+				LEDE_ERROR("timer add net_timer->id=%u hour=%u\n", net_timer->id, net_timer->hour);
+				LEDE_ERROR("set timer hour:%u min:%u week:%u flags:%u\n", 
+				net_timer->hour,net_timer->min, net_timer->week_loop, net_timer->flags);
+				period_timer.id = net_timer->id;
+				period_timer.hours = net_timer->hour;
+				period_timer.minute = net_timer->min;
+				period_timer.week = net_timer->week_loop;
+				period_timer.enable = net_timer->flags;
+				period_timer.on = net_timer->config.power;
+				period_timer.duration = 0XFFFF;
+				period_timer.ext_data = 0;
+				lede_led_state_copy(&tmp_config, &net_timer->config, COPY_TYPE_ALL);
+				if (ucd_timer_add_ext(lede_led_timer_proc, NULL, period_timer.id, &period_timer, &tmp_config, sizeof(tmp_config)) < 0) {
+					err = ERR_PARAM_INVALID;					
+				} else {
+					iw_request_event(EVENT_SYS_SAVE_CONFIG);	
+				}
+			} else {
+				err = ERR_PARAM_INVALID;
+			}
+		uc_do_set_reply((ucp_obj_t *)uobj, err);		
+		uc_push_set();
+	} else if (action == UCA_DELETE) {
+		if (uobj->param_len >= sizeof(u_int8_t)) {
+			LEDE_INFO("timer delete id=%u\n", (*param));		
+			if (ucd_timer_del_ext(*param) == RS_OK) {
+				iw_request_event(EVENT_SYS_SAVE_CONFIG);
+			}
+		} else {
+			err = ERR_PARAM_INVALID;
+		}
+		uc_do_set_reply((ucp_obj_t *)uobj, err);	
+		uc_push_set();
+	}
+}
+
+static void ICACHE_FLASH_ATTR ia_do_lede_led_all(iw_event_info_t *info, iw_obj_t *uobj)
+{
+	ia_do_lede_led_state(info, uobj);
+	ia_do_lede_led_time(info, uobj);
+}
+
+void ICACHE_FLASH_ATTR ia_do_lede_led(iw_event_info_t *info, iw_obj_t *uobj)
+{
+	
+	LEDE_DEBUG("ia_do_lede_led, sub_objct = %u, attr = %u, len = %d, action = %d\n", 
+		uobj->sub_objct, uobj->attr, uobj->param_len, info->action);
+
+	switch(uobj->attr) {
+		case ATTR_ALL:		
+			ia_do_lede_led_all(info, uobj);
+			break;
+		case UCAT_LEDE_LED_STATE:
+			ia_do_lede_led_state(info, uobj);
+			break;
+		case UCAT_LEDE_LED_TIMER:
+			ia_do_lede_led_time(info, uobj);
+			break;
+		default:
+			uc_do_set_reply((ucp_obj_t *)uobj, ERR_CMD_INVALID);	
+			break;
+	}
+}
+
+static void  lede_led_tick(void)
+{
+	int i;
+
+	if (color_init_index == color_final_index)
+		return;
+
+	if (color_step[color_init_index].ticks < 0)
+		return;
+
+	cur_tick++;
+
+	g_pwm_int_ctl_flag = 1;
+	
+	if(cur_tick >= color_step[color_init_index].ticks){
+		color_init_index = color_final_index;
+		if(color_step[color_final_index].is_next) {
+			color_final_index++;
+			if(color_final_index >= 20)
+				color_final_index = 1;
+		}
+		else
+			color_final_index = 1;
+
+		cur_tick = 0;
+	}
+
+	for (i = 0; i < 5; i++){
+		if (color_step[color_final_index].channel_val[i] > color_step[color_init_index].channel_val[i]) {
+			channel_val[i] = color_step[color_init_index].channel_val[i]
+								+ (u_int32_t)(color_step[color_final_index].channel_val[i] - color_step[color_init_index].channel_val[i]) 
+								* cur_tick / color_step[color_init_index].ticks;
+		} else {
+			channel_val[i] = color_step[color_init_index].channel_val[i]
+								- (u_int32_t)(color_step[color_init_index].channel_val[i] - color_step[color_final_index].channel_val[i]) 
+								* cur_tick / color_step[color_init_index].ticks;
+		}
+	}
+	g_pwm_int_ctl_flag = 2;
+
+	return;
+}
+
+static void pwm_tim1_handler(void *arg)
+{
+	static u_int16_t gpio_set = 0, gpio_clear = 0;
+
+    if (is_test_ssid()) {
+		return;
+	}
+
+	if (ready_to_start) {
+		return;
+	}
+
+	RTC_REG_WRITE(FRC1_LOAD_ADDRESS, g_pwm_int_ctl[g_seq].sleep);
+			
+	if(g_seq == 0){
+		gpio_set = 0;
+		gpio_clear = 0;
+		gpio_set |= g_pwm_int_ctl[g_seq].gpio_map;
+		gpio_clear |= ((~gpio_set) & LEDE_LED_GPIO_ALL);
+	} else {
+		gpio_set &= ~g_pwm_int_ctl[g_seq].gpio_map;
+		gpio_clear |= (~gpio_set)&LEDE_LED_GPIO_ALL;
+	}
+
+#if LOW_LIGHT
+	gpio_output_set(gpio_clear, gpio_set,
+				LEDE_LED_GPIO_ALL, 0);
+#else
+    gpio_output_set(gpio_set, gpio_clear,
+                LEDE_LED_GPIO_ALL, 0);
+#endif
+  	g_seq = g_pwm_int_ctl[g_seq].next;
+
+	if (g_seq == 0) {
+		if(g_pwm_int_ctl_flag == 0) {
+							//这里面就是根据网络设置过来的值进行计算
+			lede_led_tick();//实现灯光渐变，让灯光渐变为我们想要的颜色，把下一次需要停留的状态放在channel_val
+		}
+	
+		if (g_pwm_int_ctl_flag == 2){
+			cal_pwm_ctrl();//通过channel_val里面的值设置不同颜色的值
+			g_pwm_int_ctl_flag = 0;
+		}
+	}
+  
+}
+
+static pkt_t ICACHE_FLASH_ATTR * lede_push_proc(ucds_session_t *s)
+{
+	pkt_t *pkt;
+	ucp_ctrl_t *uc;
+	u_int8_t *buf;
+	int uci_send_index = 0;
+	ia_lede_led_state_t lede_led_state_tmp;
+	int len, total_len;
+	ia_lede_led_timer_t * net_timer;
+	u_int8_t *timer_buff = NULL;		
+	ucd_period_timer_node_t *node, *next;
+	
+	int count = 0;
+	
+	stlc_list_for_each_entry_safe(ucd_period_timer_node_t, node, next, &PERIOD_TIMER, link) {
+		count++;
+	}	
+
+	len = count * sizeof(ia_lede_led_timer_t);
+	total_len = sizeof(ucp_ctrl_t) + sizeof(ucp_obj_t) * 2 + sizeof(lede_led_state_tmp) + len;
+
+	LEDE_DEBUG("lede_push_proc\n");
+
+	lede_led_state_copy(&lede_led_state_tmp, &lede_led_state, COPY_TYPE_ALL);
+
+	pkt = uc_pkt_new(CMD_UDP_CTRL, total_len, 
+		true, s->is_enc, 0, s->client_sid , ucd.client.device_sid, s->my_request_id);
+
+	if (pkt == NULL) {
+		LEDE_DEBUG("_ucds_change_notify alloc failed\n");
+		return NULL;
+	}	
+
+	uc = get_ucp_payload(pkt, ucp_ctrl_t);
+	uc->action = UCA_PUSH;
+	uc->count = 2;
+
+	buf = (u_int8_t*)&(uc[1]);
+	_uc_put_elemet(buf,  total_len - sizeof(ucp_ctrl_t), &uci_send_index, 
+		UCOT_IA, UCOT_IA_LEDE_LED, UCAT_LEDE_LED_STATE, sizeof(lede_led_state_tmp), (u_int8_t *)&lede_led_state_tmp);
+
+	if (count > 0){
+		timer_buff = iw_calloc(len, 1);
+		if (!timer_buff) {
+			LEDE_DEBUG("calloc failed\n");
+			return NULL;
+		}
+
+		net_timer = (ia_lede_led_timer_t *)timer_buff;
+		stlc_list_for_each_entry_safe(ucd_period_timer_node_t, node, next, &PERIOD_TIMER, link) {
+			net_timer->id= node->timer.id;
+			net_timer->flags= node->timer.enable;
+			net_timer->week_loop= node->timer.week;
+			net_timer->hour= node->timer.hours;
+			net_timer->min= node->timer.minute;
+			lede_led_state_copy(&net_timer->config, node->timer.ext_data, COPY_TYPE_ALL);
+			
+			LEDE_DEBUG("timer id=%u node->enable=%u\n", net_timer->id, net_timer->flags);
+			net_timer++;
+		}
+
+		_uc_put_elemet(buf,  total_len - sizeof(ucp_ctrl_t), &uci_send_index, 
+			UCOT_IA, UCOT_IA_LEDE_LED, UCAT_LEDE_LED_TIMER, len, timer_buff);
+		
+		iw_free(timer_buff);
+	} else {
+
+		_uc_put_elemet(buf,  total_len - sizeof(ucp_ctrl_t), &uci_send_index, 
+			UCOT_IA, UCOT_IA_LEDE_LED, UCAT_LEDE_LED_TIMER, 0, NULL);
+	}
+	return pkt;	
+}
+
+static int ICACHE_FLASH_ATTR connect_state_check(void *arg)
+{
+#define  TIMELINE1  4
+#define  TIMELINE2  21
+	static int count = 0;
+	count++;	
+	//led灯启动5s内,RGB三原色依次点亮1s循环
+	if (is_smart_config){
+		if (count <= TIMELINE1) {
+			lede_state_set(LEDE_FLASH_1S);
+			iw_timer_set(TID_UCDC_CHECK_STATE, TIME_N_SECOND(1), 0, connect_state_check, NULL);
+		} else if (count < TIMELINE2){
+			lede_modify_status();
+			iw_timer_set(TID_UCDC_CHECK_STATE, TIME_N_SECOND(1), 0, connect_state_check, NULL);
+		} else {
+			count = TIMELINE2;
+			lede_state_set(LEDE_ALWAYS_ON);
+		}
+	} else {
+		LEDE_DEBUG("set led LEDE_FLASH_1S count:%d \n",count);
+		lede_state_set(LEDE_ALWAYS_ON); 
+	}
+	return 0;
+}
+
+void ICACHE_FLASH_ATTR lede_gpio_init(void)
+{
+    PIN_FUNC_SELECT(RED_OUT_IO_MUX, RED_OUT_IO_FUNC);
+    PIN_FUNC_SELECT(GREEN_OUT_IO_MUX, GREEN_OUT_IO_FUNC);
+    PIN_FUNC_SELECT(BLUE_OUT_IO_MUX, BLUE_OUT_IO_FUNC);
+	PIN_FUNC_SELECT(WARM_OUT_IO_MUX, WARM_OUT_IO_FUNC);
+	//初始化为高电平
+	gpio_output_set(LEDE_LED_GPIO_ALL, 0,LEDE_LED_GPIO_ALL, 0);
+}
+
+//当重启的时，初始化led的gpio口
+void ICACHE_FLASH_ATTR lede_restart_init(void) 
+{
+	ready_to_start = 1;
+	lede_gpio_init();
+}
+
+int ICACHE_FLASH_ATTR reset_onoff_times(void *arg)
+{	
+	poweronofftimes.times = 1;
+	conf_dev_set(DEV_POWERONOFF_TIMES, (UINT8*)&poweronofftimes, sizeof(poweronofftimes));
+	conf_dev_commit();	
+	return RS_OK;
+}
+void ICACHE_FLASH_ATTR check_by_power_on_smrtconfig()
+{
+	struct rst_info *rst_vab;
+	config_t *times_config;
+	
+	times_config = conf_dev_get(DEV_POWERONOFF_TIMES);	
+	if(times_config && times_config->len){
+		memcpy(&poweronofftimes, times_config->value, sizeof(poweronofftimes));		
+	}else{
+		poweronofftimes.times = 1;
+	}
+	
+	LEDE_ERROR("restart times = %d\r\n", poweronofftimes.times);	
+	if(poweronofftimes.times >= 5){
+		reset_onoff_times(NULL);
+		iw_sys_reset();		
+	}		
+	
+	rst_vab = system_get_rst_info();
+	switch(rst_vab->reason){
+    	case REASON_DEFAULT_RST:		/**< normal startup by power on 正常启动电源*/  
+			if(!needsmartconfig()){
+				poweronofftimes.times++;
+				conf_dev_set(DEV_POWERONOFF_TIMES, (UINT8*)&poweronofftimes, sizeof(poweronofftimes));
+				conf_dev_commit();
+			}
+				
+			LEDE_ERROR("reason=%u, exccause=%u, epc1=%u, epc2=%u, epc3=%u, excvaddr=%u, depc=%u\r\n", bb(rst_vab));
+
+			onoff_statue_flag = 1;
+			iw_timer_set(TID_CHECK_SMARTCONFIG, TIME_N_SECOND(60), 0, reset_onoff_times, NULL);
+			break;
+        case REASON_WDT_RST:			/**< hardware watch dog reset 硬件看门狗复位*/
+        case REASON_EXCEPTION_RST: 		/**< exception reset, GPIO status won't change 异常复位，GPIO地位不会改变*/
+        case REASON_SOFT_WDT_RST:  		/**< software watch dog reset, GPIO status won't change 软件看门狗复位，GPIO的状态不会改变*/ 
+        case REASON_SOFT_RESTART: 		/**< software restart ,system_restart , GPIO status won't change 软件重启，重启系统，GPIO地位不会改变*/	
+        case REASON_DEEP_SLEEP_AWAKE: 	/**< wake up from deep-sleep 从沉睡中醒来*/	
+        case REASON_EXT_SYS_RST:		/**< external system reset 外部系统复位*/
+			LEDE_ERROR("reason=%u, exccause=%u, epc1=%u, epc2=%u, epc3=%u, excvaddr=%u, depc=%u\r\n", bb(rst_vab));
+			onoff_statue_flag = 0;
+			break;
+		default:
+			LEDE_ERROR("reason=%u, exccause=%u, epc1=%u, epc2=%u, epc3=%u, excvaddr=%u, depc=%u\r\n", bb(rst_vab));
+			break;
+	}
+	
+}
+
+void ICACHE_FLASH_ATTR lede_led_init(void)
+{
+	LEDE_INFO("lede_led_init, smatconfig = %d\r\n", is_smart_config);
+
+    //RTC_REG_WRITE(FRC1_LOAD_ADDRESS, 0);
+	lede_gpio_init();
+
+	lede_set_freq_duty(500,255);//把一个周期分成了255份，每一份是8us
+    if(needsmartconfig()) {
+           set_smart_config();
+    }
+	
+	check_by_power_on_smrtconfig();
+	connect_state_check(NULL);		
+
+    RTC_REG_WRITE(FRC1_CTRL_ADDRESS,
+              DIVDED_BY_16
+              | FRC1_ENABLE_TIMER
+              | TM_EDGE_INT);
+
+	RTC_REG_WRITE(FRC1_LOAD_ADDRESS, 20);
+	
+	ETS_FRC_TIMER1_INTR_ATTACH(pwm_tim1_handler, NULL);
+	TM1_EDGE_INT_ENABLE();
+	ETS_FRC1_INTR_ENABLE();
+
+	uc_push_init(lede_push_proc);
+	config_timer_init(lede_led_timer_proc, NULL);
+}
+
+static void ICACHE_FLASH_ATTR lede_led_config_init(void)
+{
+    config_t *config;
+	u_int8_t flag = 0;  // 1 上一次是WIFI up     2 上一次是WIFI down
+
+	config = conf_dev_get(DEV_LEDE_COLOR_CONFIG);
+	if (config) {
+		LEDE_ERROR("get config is ok\r\n");
+	}
+
+
+	//如果是产测模式，连上WIFI显示红色，连接WIFI失败，蓝灯一直闪烁
+
+	if (1 == is_product_mode_f()) {
+		if (is_wifi_up()) {
+			// 避免重复进入
+			if (flag != 1) {
+				flag = 1;
+				change_mode_id(18);
+			}
+		} else {
+			if (flag !=2 ) {
+				flag = 2;
+				change_mode_id(12);
+			}
+		}
+	} else {
+		if(config && config->len) {
+	        os_memcpy(&lede_led_state, config->value, config->len);
+			LEDE_DEBUG("onoff_statue_flag.flag = %d\r\n", onoff_statue_flag);
+			if(onoff_statue_flag == 1){
+				lede_led_state.power = 1;		
+			}
+			lede_led_do_state();
+		} else {
+			change_mode_id(DEFAULT_MODE);
+		}
+	}
+}
+
+void ICACHE_FLASH_ATTR lede_led_config_save(void)
+{
+
+	//如果状态指示灯，则不保存配置
+	if (lede_led_state.mod_id >= LEDE_PAVITE_MODE_BEGIN &&
+		lede_led_state.power == 1) {
+		return;
+	}
+	conf_dev_set(DEV_LEDE_COLOR_CONFIG, (void*)&lede_led_state, sizeof(lede_led_state));
+        
+}
+
+static void ICACHE_FLASH_ATTR change_mode_id(int id) 
+{
+	lede_led_state.mod_id = id;
+	lede_led_state.power = 1;
+	lede_led_do_state();
+}
+
+int ICACHE_FLASH_ATTR lede_state_set(u_int8_t status)
+{
+	static int8_t tmp = -1;
+	LEDE_DEBUG("new state:%d old state: %d\n",status ,tmp);
+
+	//tmp 防止同一种状态，被不停的调用，导致颜色显示出现问题
+	if (tmp != status || (1 == is_product_mode_f())) {
+		tmp = status; 
+		
+		switch(status) {
+			case LEDE_CRAZE_BLINK:
+				change_mode_id(11);
+				break;
+			case LEDE_SLOW_BLINK:
+				change_mode_id(12);
+				break;
+			case LEDE_IS_SCANAP:
+			case LEDE_FAST_BLINK:
+				change_mode_id(10);	
+				break;	
+			case LEDE_BLINK_3sON_200msOFF:
+				change_mode_id(13);
+				break;
+			case LEDE_ALWAYS_ON:
+				lede_led_config_init();
+				break;
+			case LEDE_ALWAYS_OFF:
+				change_mode_id(14);
+				break;
+			case LEDE_ALL_ON:
+				change_mode_id(16);
+				break;
+			case LEDE_FLASH_1S:
+				change_mode_id(17);
+				break;
+			case LEDE_PRODUCT_RED:
+				change_mode_id(18);
+				break;	
+			default:
+				lede_led_config_init();
+				LEDE_ERROR("lede_state_set Unkown state %d\n",status);
+				break;
+		}
+	}
+
+return 0;
+}
+
+static  void ICACHE_FLASH_ATTR lede_modify_status(void)
+{
+	u_int8_t status;
+	iw_sys_info_t *info = &piw_priv->iw_sys;
+
+	//如果不是一键配置，不需要改变状态灯
+	if (!is_smart_config) {
+		LEDE_DEBUG("not in smart config ,no need change the status of led\n");
+		return;
+	}
+
+	if (!info->smcf_stat) {
+		LEDE_DEBUG("!info->smcf_stat is true \n");
+		return;
+	}
+	
+	if (SMCF_STA_ISSCAN_AP == info->smcf_stat) {
+		status = LEDE_SLOW_BLINK;
+	} else if(SMCF_STA_SNIFF == info->smcf_stat || SMCF_STA_ISLOCKAP == info->smcf_stat) {
+		status = LEDE_SLOW_BLINK;
+	} else if (SMCF_STA_CONFOK == info->smcf_stat){
+		status = LEDE_SLOW_BLINK;
+	} else {
+		status = LEDE_ALWAYS_ON;
+		is_smart_config = 0;
+	}
+	LEDE_DEBUG("state change new state %u smart_state:%d\n",status, info->smcf_stat);
+
+	lede_state_set(status);
+}
+
+static void ICACHE_FLASH_ATTR set_smart_config()
+{
+	is_smart_config = 1;
+}
+
+

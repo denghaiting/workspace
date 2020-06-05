@@ -1,0 +1,89 @@
+/**************************************************************************
+**  Copyright (c) 2010 GalaxyWind, Ltd.
+**
+**  Project: iw_uart_ijuartpro.h
+**  File:    iw_uart_ijuartpro.h
+**  Author:  
+**  Date:    06/11/2015
+**
+**  Purpose:
+**    Uart i+ parese .
+**************************************************************************/
+
+
+#ifndef IW_UART_IJUARTPRO_H
+#define IW_UART_IJUARTPRO_H
+
+
+#ifdef __cplusplus
+extern "C"
+{
+#endif /* __cplusplus */
+
+/* Include files. */
+
+
+/* Macro constant definitions. */
+//框架参数
+#define MAX_UART_BD_NUM			3
+#define UART_DATA_LEN    256
+#define UART_SYNC1		0xFF
+#define UART_SYNC2		0xAA
+
+#define UART_HEAD_LEN	6
+#define UART_CHECKSUM_LEN 2
+#define SEND_UART_PKT_PERIOD 200
+#define UART_QUERY_TIME 1
+#define WIFI_STAT_DISC 0
+#define WIFI_STAT_ROUTER 1
+#define WIFI_STAT_SERVER 2
+
+
+/* Type definitions. */
+
+//串口接受数据状态
+typedef enum {
+	US_NONE,
+	US_SYNC2,
+	US_HEAD,
+	US_DATA,
+}linkon_us_t;
+typedef struct {
+	u8 has_data;
+	u8 data_len;
+	u8 data[UART_DATA_LEN];
+} linkon_uart_db_t;
+//串口信息
+typedef struct linkon_uart_s{
+	bool init_done;
+	linkon_uart_db_t *cur_uart_db;
+	linkon_uart_db_t uart_db[MAX_UART_BD_NUM];
+    u8 bd_parse_begin;
+	u8 state;
+	u_int16_t index_read;
+	u64 last_input_time;		// 最后一次串口输入的时间
+	u16 need_data_len;
+}linkon_uart_t;
+
+typedef struct {
+	struct stlc_list_head link;
+	u8 len;
+}linkon_uart_pkt_t;
+
+
+/* External function declarations. */
+void  iw_uart_ijuartproto_init(void);
+
+void base_uart_send(u_int8_t *data, u_int16_t len);
+/* Macro API definitions. */
+
+
+/* Global variable declarations. */
+
+
+#ifdef __cplusplus
+} /* extern "C" */
+#endif /* __cplusplus */
+
+#endif /* IW_UART_IJUARTPRO_H */
+

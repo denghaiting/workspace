@@ -1,0 +1,188 @@
+ /**************************************************************************
+**  Copyright (c) 2011 GalaxyWind, Ltd.
+**
+**  Project: lede_led
+**  File:    lede_led.h
+**  Author:  tanhongguo
+**  Date:    02/06/2015
+**
+**  Purpose:
+**    lede_led.
+**************************************************************************/
+
+
+#ifndef LEDE_LED_H
+#define LEDE_LED_H
+
+#include "udp_ctrl.h"
+
+
+#ifdef __cplusplus
+extern "C"
+{
+#endif /* __cplusplus */
+
+
+#if 0
+//原开发板上的gpio对应三原色
+#define RED_OUT_IO_MUX    PERIPHS_IO_MUX_MTDO_U
+#define RED_OUT_IO_NUM    15
+#define RED_OUT_IO_FUNC   FUNC_GPIO15
+
+
+#define GREEN_OUT_IO_MUX PERIPHS_IO_MUX_MTCK_U
+#define GREEN_OUT_IO_NUM 13
+#define GREEN_OUT_IO_FUNC  FUNC_GPIO13
+
+#define BLUE_OUT_IO_MUX PERIPHS_IO_MUX_MTDI_U
+#define BLUE_OUT_IO_NUM 12
+#define BLUE_OUT_IO_FUNC  FUNC_GPIO12
+
+#define WARM_OUT_IO_MUX PERIPHS_IO_MUX_MTDO_U
+#define WARM_OUT_IO_NUM 15
+#define WARM_OUT_IO_FUNC  FUNC_GPIO15
+
+#define	RED_GPIO	RED_OUT_IO_NUM
+#define	GREEN_GPIO	GREEN_OUT_IO_NUM
+#define	BLUE_GPIO	BLUE_OUT_IO_NUM
+#define	WARM_GPIO	WARM_OUT_IO_NUM
+#define	COLD_GPIO	3
+
+#else
+//w0模版gpio口对应
+#define RED_OUT_IO_MUX     PERIPHS_IO_MUX_GPIO5_U
+#define RED_OUT_IO_NUM     5
+#define RED_OUT_IO_FUNC    FUNC_GPIO5
+
+#define GREEN_OUT_IO_MUX   PERIPHS_IO_MUX_MTCK_U
+#define GREEN_OUT_IO_NUM   13
+#define GREEN_OUT_IO_FUNC  FUNC_GPIO13
+
+#define BLUE_OUT_IO_MUX    PERIPHS_IO_MUX_MTDI_U
+#define BLUE_OUT_IO_NUM    12
+#define BLUE_OUT_IO_FUNC   FUNC_GPIO12
+
+#define WARM_OUT_IO_MUX    PERIPHS_IO_MUX_MTMS_U
+#define WARM_OUT_IO_NUM    14
+#define WARM_OUT_IO_FUNC   FUNC_GPIO15
+#endif
+
+#define	RED_GPIO	RED_OUT_IO_NUM
+#define	GREEN_GPIO	GREEN_OUT_IO_NUM
+#define	BLUE_GPIO	BLUE_OUT_IO_NUM
+#define	WARM_GPIO	WARM_OUT_IO_NUM
+#define	COLD_GPIO	3
+
+#if 1
+#define LEDE_LED_GPIO_ALL ((1 << RED_GPIO) | (1 << GREEN_GPIO) | (1 << BLUE_GPIO) | (1 << WARM_GPIO))
+#else
+#define LEDE_LED_GPIO_ALL ((1 << GREEN_GPIO) | (1 << BLUE_GPIO)| (1 << RED_GPIO))
+#endif
+#define PER_1S_US 1000000
+#define PER_1MS_US 1000
+
+/* Macro constant definitions. */
+#define 	LEDE_FAST_BLINK		         0
+#define 	LEDE_SLOW_BLINK		         1
+#define 	LEDE_ALWAYS_ON		         2
+#define 	LEDE_ALWAYS_OFF	             3
+#define 	LEDE_CRAZE_BLINK             4 
+#define 	LEDE_IS_SCANAP               5
+#define 	LEDE_BLINK_3sON_200msOFF     6
+#define 	LEDE_ALL_ON                  7
+#define 	LEDE_FLASH_1S                8
+#define 	LEDE_PRODUCT_RED             9
+//#define 	LEDE_CRAZE_PHONE_BLINK		 10
+
+
+#pragma pack(push,1)
+
+typedef struct{
+	u_int8_t	R;			/*红色0~255*/
+	u_int8_t	G;			/*绿色0~255*/
+	u_int8_t	B; 			/*蓝色0~255*/
+	u_int8_t	L; 			/*亮度0~100*/
+	u_int8_t	cold;		/*色温冷度0~100, 0代表最暖，100代表最冷*/
+	u_int8_t	power;		/*开关，0为关，1为开*/
+	u_int8_t	mod_id;		/*模式id*/
+	u_int8_t	action;		/*0彩色模式，1白光模式*/
+} ia_lede_led_state_t;
+
+#define	LEDE_LED_TIMER_FLAG_ENABLE	0x01
+
+typedef struct {
+	u_int8_t	id;				/*定时器id,有效值从1开始*/
+	u_int8_t	flags;			/*bit0:enable*/
+	u_int8_t	week_loop;		/*bit0代表星期天，bit1代表星期一，等等。为0代表不循环，到期后自动删除*/
+	u_int8_t	hour;			/*小时*/
+	u_int8_t	min;			/*分*/
+	u_int8_t	pad1;
+	u_int16_t	pad2;
+	ia_lede_led_state_t	config;	/*定时器到期后，使用该设置更新led状态*/
+} ia_lede_led_timer_t;
+
+
+#pragma pack(pop)
+
+typedef struct {
+	u_int32_t gpio_map;
+	int sleep;
+	int next;
+} ia_lede_led_pwm_ctl_t;
+
+/*
+	功能:
+		网络信息设置魔灯参数
+	输入参数:
+		@info: 回调事件信息
+		@uobj: 属性值
+	输出参数:
+	返回值:
+	说明:
+*/
+void ia_do_lede_led(iw_event_info_t *info, iw_obj_t *uobj);
+/*
+	功能:
+		魔灯初始化
+	输入参数:
+	输出参数:
+	返回值:
+	说明:
+*/
+void lede_led_init(void);
+/*
+	功能:
+		保存魔灯显示状态
+	输入参数:
+	输出参数:
+	返回值:
+	说明:
+*/
+void lede_led_config_save(void);
+/*
+	功能:
+		设置魔灯的模式
+	输入参数:
+		@status: 魔灯的模式
+	输出参数:
+	返回值:
+		0: 成功
+	说明:
+*/
+int lede_state_set(u_int8_t status);
+/*
+	功能:
+		当重启的时，初始化led的gpio口
+	输入参数:
+	输出参数:
+	返回值:
+	说明:
+*/
+void lede_restart_init(void);
+
+#ifdef __cplusplus
+} /* extern "C" */
+#endif /* __cplusplus */
+
+#endif /* LEDE_LED_H */
+

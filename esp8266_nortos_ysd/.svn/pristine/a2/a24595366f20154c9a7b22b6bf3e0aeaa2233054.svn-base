@@ -1,0 +1,305 @@
+/**************************************************************************
+**  Copyright (c) 2013 GalaxyWind, Ltd.
+**
+**  Project: 魔灯
+**  File:    iw_main.c
+**  Author:  fangfuhan
+**  Date:    04/08/2016
+**
+**  Purpose:
+**    初始化.
+**************************************************************************/
+
+
+/* Include files. */
+#include "iw_priv.h"
+#include "mu_type.h"
+#include "iw_ijcfg.h"
+#include "iw_dev_timer.h"
+#include "iw_user_config.h"
+#include "iw_linkage_conf.h"
+#include "iw_uart.h"
+#include "iw_smartconfig.h"
+#include "osapi.h"
+#include "iw_upgrade.h"
+#include "stm_upgrade.h"
+#include "iw_dev.h"
+#include "iw_lan_srv.h"
+#include "user_interface.h"
+#include "iw_ntp_time_syn.h"
+#include "iw_sys_time.h"
+#include "iw_dev_timer.h"
+#include "iw_debug_net.h"
+#include "ice_domain.h"
+#include "domain.h"
+
+/* Macro constant definitions. */
+
+
+/* Type definitions. */
+
+
+/* Local function declarations. */
+
+
+/* Macro API definitions. */
+#define MAIN_DEBUG_
+#ifdef MAIN_DEBUG_
+#define MAIN_DEBUG(x...) ERROR(x)
+#define MAIN_INFO(x...)  ERROR(x)
+#define MAIN_ERROR(x...)  ERROR(x)
+#else
+#define MAIN_DEBUG(x...) DEBUG(x)
+#define MAIN_INFO(x...)	 INFO(x)
+#define MAIN_ERROR(x...) ERROR(x)
+#endif
+
+/* Global variable declarations. */
+static iw_priv_t siw_priv;
+iw_priv_t *piw_priv;
+sys_shm_t  sys_shm;
+
+int iw_sys_timer(void *arg);
+extern rs_t iw_lan_srv_init(iw_priv_t *piw);
+
+static void wifi_init()
+{
+	iw_sys_info_t *info = (iw_sys_info_t *)&piw_priv->iw_sys;
+	config_t *config1, *config2;
+			
+	config1 = conf_wifi_get(WIFI_PASSWD_INDEX);
+	config2 = conf_wifi_get(WIFI_SSID_INDEX);
+
+	if (config2 != NULL){
+		os_memcpy((uint8_t *)info->ssid, (uint8_t *)config2->value, config2->len);
+		if (config1) {
+			os_memcpy((uint8_t *)info->passwd, (uint8_t *)config1->value, config1->len);
+		} else {
+			info->passwd[0] = '\0';
+		}
+	}	
+}
+
+bool ICACHE_FLASH_ATTR needsmartconfig(void)
+{
+	iw_sys_info_t *info = (iw_sys_info_t *)&piw_priv->iw_sys;
+
+	if (strlen(info->ssid) == 0)
+		return true;
+
+	return false;
+}
+
+/* Global variable declarations. */
+static void ICACHE_FLASH_ATTR wifi_handle_event_cb(System_Event_t *evt)
+{
+	iw_sys_info_t *info = (iw_sys_info_t *)&piw_priv->iw_sys;
+	
+	switch (evt->event) {
+		case EVENT_STAMODE_CONNECTED:
+			piw_priv->iw_sys.wifi_connect_time = get_sec();
+			
+			info->smcf_stat = SMCF_STA_CONNECTAP;
+			MAIN_INFO("connect to ssid %s, channel %d\r\n",evt->event_info.connected.ssid,evt->event_info.connected.channel);
+			break;
+		case EVENT_STAMODE_DISCONNECTED:
+			info->smcf_stat = SMCF_STA_DISCONNECTAP;
+			MAIN_INFO("disconnect from ssid %s, reason %d\r\n",evt->event_info.disconnected.ssid,	evt->event_info.disconnected.reason);
+			break;
+		case EVENT_STAMODE_AUTHMODE_CHANGE:
+			info->smcf_stat = SMCF_STA_DISCONNECTAP;
+			MAIN_INFO("mode: %d -> %d\r\n",evt->event_info.auth_change.old_mode,evt->event_info.auth_change.new_mode);
+			break;
+		case EVENT_STAMODE_GOT_IP:
+			info->smcf_stat = SMCF_STA_GETIP;
+			MAIN_INFO("ip:" IPSTR ",mask:" IPSTR ",gw:" IPSTR "\r\n",IP2STR(&evt->event_info.got_ip.ip),IP2STR(&evt->event_info.got_ip.mask),IP2STR(&evt->event_info.got_ip.gw));
+
+			{
+				struct ip_info ipinfo;
+				wifi_get_ip_info(STATION_IF, &ipinfo);
+				piw_priv->iw_sys.ip = evt->event_info.got_ip.ip.addr;
+				piw_priv->iw_sys.mask = evt->event_info.got_ip.mask.addr;
+				piw_priv->iw_sys.gateway = evt->event_info.got_ip.gw.addr;
+				piw_priv->iw_sys.is_linkup  = true;		
+			}				
+			break;
+		default:
+			break;
+	}
+	
+}
+
+/**************************************************************************
+**  Function Name: iw_sys_init
+**  Purpose:
+**    魔灯.
+**  Parameters:
+**    iw_init_t *ii - 厂商名.
+**  Return:
+**    None.
+**  Author:  fangfuhan
+**  Date:    04/14/2016
+**  Notes:
+**    wifi_station_connect();不能在user_init里面调用
+**************************************************************************/
+rs_t ICACHE_FLASH_ATTR iw_sys_init(iw_init_t *ii)
+{	
+	piw_priv = &siw_priv;
+	
+	struct station_config stcfg;
+	iw_sys_info_t *info = (iw_sys_info_t *)&piw_priv->iw_sys;	
+
+	os_memset(piw_priv, 0, sizeof(*piw_priv));
+	os_strcpy(piw_priv->iw_sys.descript, ii->desc);
+
+	iw_uptime_init();
+	iw_local_time_init();	
+	iw_ntp_time_syn_init();
+	
+	iw_thread_timer_init();	
+	
+	iw_event_init(piw_priv);
+	iw_uart_event_init();
+
+	lc_init();
+
+	//读取wifi连接ssid，passwd
+	wifi_init();
+	//无线连接状态的回调函数
+	wifi_set_event_handler_cb(wifi_handle_event_cb);
+	if(needsmartconfig()){
+		MAIN_INFO("need smartconfig\n");
+		iw_smartcfg_start();
+	}else{
+		MAIN_INFO("don't need smartconfig\n");
+		wifi_station_get_config(&stcfg);
+		os_strcpy((char *)stcfg.ssid, (char *)info->ssid);
+		os_strcpy((char *)stcfg.password, (char *)info->passwd);
+		wifi_station_set_config(&stcfg);
+		wifi_station_connect();
+		if(!wifi_station_get_auto_connect()){
+			int ret = wifi_station_set_auto_connect(1);
+			ret = ret;  //解决编译警告
+			MAIN_INFO("set wifi auto connect return %d\n", ret);
+		}
+	}
+
+	//初始化网络打印
+	ucds_net_debug_notify_init();
+
+	//dns解析模块
+	domain_init();
+	dn_init();
+	
+    //FOTA 网络升级功能
+    sys_upgrade_init();
+
+#ifdef HAS_STM_UPGRADE	
+	stm_upgrade_init();
+	//stm_image_init();
+#endif
+
+	//网络通信，连接服务器和监听手机连接	
+	iw_dev_init(piw_priv);
+	iw_lan_srv_init(piw_priv);
+
+	//局域网发现模块
+    iw_init_ijcfg(piw_priv);
+
+	//通用定时器
+	iw_ucd_timer_init();
+
+	//每秒定时器
+	memset(&sys_shm, 0, sizeof(sys_shm));
+	iw_timer_set(TID_SYS_EVENT_TIMER, TIME_N_SECOND(1), 1, iw_sys_timer, NULL);
+	
+	return RS_OK;
+}
+
+rs_t ICACHE_FLASH_ATTR iw_sys_info_get(iw_sys_info_t *info)
+{
+	if(info){
+		os_memcpy(info, &piw_priv->iw_sys, sizeof(*info));
+		return RS_OK;
+	}
+	return RS_INVALID_PARAM;
+}
+
+rs_t ICACHE_FLASH_ATTR iw_sys_reboot()
+{
+#if (IW_PLATFORM==PLT_8266)
+
+	//重启前disable led gpio口的控制
+	//lede_restart_init();
+
+	system_restart();
+
+#elif (IW_PLATFORM==PLT_6621)
+
+
+
+#else
+#error "Please define IW_PLATFORM"
+#endif
+	return RS_OK;
+
+}
+
+rs_t ICACHE_FLASH_ATTR iw_sys_reset() 
+{
+    config_reset();
+	iw_request_event(EVENT_SYS_REBOOT);
+	return RS_OK;
+}
+
+void ICACHE_FLASH_ATTR save_config_all()
+{
+	if (1 == is_product_mode_f()) {
+		MAIN_ERROR("in product mode ,save in flash failed\n");
+		return;
+	}
+	
+	mu_sys_config_save();
+	//lede_led_config_save();
+	config_timer_save();
+	
+    conf_user_commit();
+    conf_dev_commit();
+}
+
+int ICACHE_FLASH_ATTR iw_sys_timer(void *arg)
+{	
+	if(sys_shm.event[EVENT_SYS_SAVE_CONFIG].have_event) {
+		save_config_all();
+        sys_shm.event[EVENT_SYS_SAVE_CONFIG].have_event = false;
+	}
+
+	if(sys_shm.event[EVENT_SYS_REBOOT].have_event) {
+		sys_shm.event[EVENT_SYS_REBOOT].have_event = false;
+		iw_sys_reboot();
+	}
+
+	if(sys_shm.event[EVENT_SYS_WIFI_CONFIG].have_event) {
+		start_wifi_config_save();
+	    conf_wifi_commit();	
+		sys_shm.event[EVENT_SYS_WIFI_CONFIG].have_event = false;
+	}
+
+	if (sys_shm.event[EVENT_SETUP_TIMER].have_event) {
+		sys_shm.event[EVENT_SETUP_TIMER].have_event = false;
+		ucd_timer_rebuild();
+	}
+
+	return RS_OK;
+}
+
+void ICACHE_FLASH_ATTR iw_request_event(unsigned char event)
+{	
+	if (event < EVENT_SYS_MAX) {
+		sys_shm.event[event].have_event = true;
+	}
+}
+
+
+
+
